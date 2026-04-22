@@ -1,0 +1,5 @@
+pandas
+requests
+streamlit
+streamlit-echarts
+openpyxl
