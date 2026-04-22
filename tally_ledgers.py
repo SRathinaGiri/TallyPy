@@ -15,6 +15,8 @@ LEDGER_OUTPUT_COLUMNS = [
     "Name",
     "PrimaryGroup",
     "Nature",
+    "NatureOfGroup",
+    "PAN",
     "StartingFrom",
     "CurrencyName",
     "StateName",
@@ -186,18 +188,18 @@ def nature_from_primary_group(primary_group):
         "bank accounts", "cash-in-hand", "deposits (asset)", "loans & advances (asset)",
         "stock-in-hand", "sundry debtors"
     ]:
-        return "Assets"
+        return "BS", "Assets"
     elif pg in [
         "capital account", "current liabilities", "loans (liability)", "suspense account",
         "branch / divisions", "bank od a/c", "duties & taxes", "provisions",
         "reserves & surplus", "secured loans", "sundry creditors", "unsecured loans"
     ]:
-        return "Liabilities"
+        return "BS", "Liabilities"
     elif pg in ["direct incomes", "indirect incomes", "sales accounts"]:
-        return "Income"
+        return "PL", "Income"
     elif pg in ["direct expenses", "indirect expenses", "purchase accounts"]:
-        return "Expenses"
-    return "Unknown"
+        return "PL", "Expenses"
+    return "Unknown", "Unknown"
 
 
 def ledger_primary_group(ledger_name, ledger_meta):
@@ -290,7 +292,7 @@ def build_ledger_request_xml(company):
         f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
         "<COLLECTION NAME=\"MyLedgers\"><TYPE>Ledger</TYPE>"
-        "<FETCH>Name, Parent, PartyGSTIN, MasterID, StartingFrom, CurrencyName, StateName, OpeningBalance, ClosingBalance</FETCH>"
+        "<FETCH>Name, Parent, PartyGSTIN, MasterID, StartingFrom, CurrencyName, StateName, OpeningBalance, ClosingBalance, IncomeTaxNumber</FETCH>"
         "<COMPUTE>PrimaryGroup:$_PrimaryGroup</COMPUTE>"
         "<COMPUTE>CurrencySymbol:$UnicodeSymbol:Currency:$CurrencyName</COMPUTE>"
         "<COMPUTE>CurrencyFormalName:$FormalName:Currency:$CurrencyName</COMPUTE>"
@@ -316,12 +318,16 @@ def parse_ledgers(root, group_map=None):
 
         parent = direct_child_text(elem, "PARENT")
         g_info = group_map.get(parent, {})
-        nature = g_info.get("Nature", "")
+        nature_of_group = g_info.get("Nature", "")
         primary_group = g_info.get("PrimaryGroup", "") or first_non_empty_text(elem, ["PRIMARYGROUP"]) or first_descendant_text(elem, "PRIMARYGROUP")
 
         row = {
             "MasterID": clean_text(elem.get("MASTERID")) or direct_child_text(elem, "MASTERID"),
             "Name": name,
+            "PrimaryGroup": primary_group,
+            "Nature": "",
+            "NatureOfGroup": nature_of_group,
+            "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]) or first_descendant_text(elem, "INCOMETAXNUMBER"),
             "StartingFrom": first_non_empty_text(elem, ["STARTINGFROM"]) or first_descendant_text(elem, "STARTINGFROM"),
             "CurrencyNameRaw": first_non_empty_text(elem, ["CURRENCYNAME"]) or first_descendant_text(elem, "CURRENCYNAME"),
             "CurrencySymbolRaw": first_non_empty_text(elem, ["CURRENCYSYMBOL"]) or first_descendant_text(elem, "CURRENCYSYMBOL"),
@@ -332,8 +338,6 @@ def parse_ledgers(root, group_map=None):
             "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"]) or first_descendant_text(elem, "PARTYGSTIN"),
             "OpeningBalance": to_float(first_non_empty_text(elem, ["OPENINGBALANCE"]) or first_descendant_text(elem, "OPENINGBALANCE")),
             "ClosingBalance": to_float(first_non_empty_text(elem, ["CLOSINGBALANCE"]) or first_descendant_text(elem, "CLOSINGBALANCE")),
-            "PrimaryGroup": primary_group,
-            "Nature": nature
         }
         ledger_rows.append(row)
         ledger_lookup[name] = row
@@ -343,11 +347,18 @@ def parse_ledgers(root, group_map=None):
             row["PrimaryGroup"] = ledger_primary_group(row["Name"], ledger_lookup)
         
         pg = row["PrimaryGroup"]
-        if not row["Nature"] and pg:
-            row["Nature"] = group_map.get(pg, {}).get("Nature", "")
+        if not row["NatureOfGroup"] and pg:
+            row["NatureOfGroup"] = group_map.get(pg, {}).get("Nature", "")
+        
+        if row["NatureOfGroup"]:
+            n_val = row["NatureOfGroup"].lower()
+            if n_val in ["assets", "liabilities"]: row["Nature"] = "BS"
+            elif n_val in ["income", "expenses"]: row["Nature"] = "PL"
             
         if not row["Nature"] and pg:
-            row["Nature"] = nature_from_primary_group(pg)
+            bs_pl, nog = nature_from_primary_group(pg)
+            row["Nature"] = bs_pl
+            row["NatureOfGroup"] = nog
 
     return ledger_rows
 

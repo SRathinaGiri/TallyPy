@@ -156,18 +156,18 @@ def nature_from_primary_group(primary_group):
         "bank accounts", "cash-in-hand", "deposits (asset)", "loans & advances (asset)",
         "stock-in-hand", "sundry debtors"
     ]:
-        return "Assets"
+        return "BS", "Assets"
     elif pg in [
         "capital account", "current liabilities", "loans (liability)", "suspense account",
         "branch / divisions", "bank od a/c", "duties & taxes", "provisions",
         "reserves & surplus", "secured loans", "sundry creditors", "unsecured loans"
     ]:
-        return "Liabilities"
+        return "BS", "Liabilities"
     elif pg in ["direct incomes", "indirect incomes", "sales accounts"]:
-        return "Income"
+        return "PL", "Income"
     elif pg in ["direct expenses", "indirect expenses", "purchase accounts"]:
-        return "Expenses"
-    return "Unknown"
+        return "PL", "Expenses"
+    return "Unknown", "Unknown"
 
 
 def post_to_tally(url, xml_text, timeout=120):
@@ -299,6 +299,7 @@ def build_request_xml(company, from_date, to_date):
 <COMPUTE NAME="DrCr">If $$AsAmount:##AmountSignedForDRCR &lt; 0 Then "Dr" Else "Cr"</COMPUTE>
 <COMPUTE NAME="ParentLedger">$Parent:Ledger:$LedgerName</COMPUTE>
 <COMPUTE NAME="PrimaryGroup">$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>
+<COMPUTE NAME="PAN">$IncomeTaxNumber:Ledger:$LedgerName</COMPUTE>
 <COMPUTE NAME="LedMasterID">$MasterID:Ledger:$LedgerName</COMPUTE>
 <COMPUTE NAME="LedgerGSTIN">$PartyGSTIN:Ledger:$LedgerName</COMPUTE>
 <COMPUTE NAME="StatusOptional">If $IsOptional Then "Yes" Else "No"</COMPUTE>
@@ -344,9 +345,18 @@ def parse_rows(root, vtype_map=None, group_map=None):
         voucher_type = direct_child_text(obj, "VOUCHERTYPENAME")
         
         base_v_type = vtype_map.get(voucher_type, voucher_type)
-        nature = group_map.get(primary_group, {}).get("Nature", "")
+        nature_of_group = group_map.get(primary_group, {}).get("Nature", "")
+        nature = ""
+        
+        if nature_of_group:
+            nv = nature_of_group.lower()
+            if nv in ["assets", "liabilities"]: nature = "BS"
+            elif nv in ["income", "expenses"]: nature = "PL"
+            
         if not nature:
-            nature = nature_from_primary_group(primary_group)
+            bs_pl, nog = nature_from_primary_group(primary_group)
+            nature = bs_pl
+            nature_of_group = nog
 
         row = {
             "Date": format_tally_date(direct_child_text(obj, "DATE")),
@@ -366,6 +376,8 @@ def parse_rows(root, vtype_map=None, group_map=None):
             "ParentLedger": direct_child_text(obj, "PARENTLEDGER"),
             "PrimaryGroup": primary_group,
             "Nature": nature,
+            "NatureOfGroup": nature_of_group,
+            "PAN": direct_child_text(obj, "PAN"),
             "LedgerGSTIN": direct_child_text(obj, "LEDGERGSTIN"),
             "StatusOptional": status_optional,
             "CompanyName": direct_child_text(obj, "COMPANYNAME"),
