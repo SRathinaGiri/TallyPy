@@ -378,13 +378,8 @@ def build_inventory_entries_request_xml(company, from_date, to_date):
         "<TDL><TDLMESSAGE>"
         "<COLLECTION NAME=\"MyInventoryVouchers\"><TYPE>Voucher</TYPE>"
         "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, "
-        "InventoryEntries.StockItemName, InventoryEntries.BilledQty, "
-        "InventoryEntries.Rate, InventoryEntries.Amount, "
-        "InventoryEntries.BatchAllocations.BatchName, "
-        "InventoryEntries.BatchAllocations.GodownName</FETCH>"
-        "<FILTER>HasInventory</FILTER>"
+        "InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH>"
         "</COLLECTION>"
-        "<SYSTEM TYPE='Formulae' NAME='HasInventory'>NOT $$IsEmpty:$InventoryEntries</SYSTEM>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
 
@@ -548,24 +543,30 @@ def parse_inventory_entries(root, company):
         if strip_ns(voucher.tag).upper() != "VOUCHER":
             continue
         v_type = direct_child_text(voucher, "VOUCHERTYPENAME")
+        if "Order" in v_type:
+            continue
         v_date = format_tally_date(direct_child_text(voucher, "DATE"))
         v_number = direct_child_text(voucher, "VOUCHERNUMBER")
         v_narration = first_non_empty_text(voucher, ["NARRATION", "VOUCHERNARRATION"])
         v_company = first_non_empty_text(voucher, ["COMPANYNAME", "SVCURRENTCOMPANY"]) or company
 
-        inv_nodes = direct_children(voucher, "INVENTORYENTRIES.LIST")
-        if not inv_nodes:
-             inv_nodes = direct_children(voucher, "ALLINVENTORYENTRIES.LIST")
+        # GREEDY SEARCH: Find ANY tag that contains inventory data
+        inv_nodes = [child for child in voucher if "INVENTORYENTRIES" in child.tag.upper()]
 
         for inv in inv_nodes:
             item_name = direct_child_text(inv, "STOCKITEMNAME")
             if not item_name:
                 continue
-            amount_val = to_decimal(direct_child_text(inv, "AMOUNT"))
+            
+            is_pos_val = direct_child_text(inv, "ISDEEMEDPOSITIVE")
+            is_inward = (is_pos_val.upper() == "YES")
+
+            amount_val = abs(to_decimal(direct_child_text(inv, "AMOUNT")))
             qty_text = direct_child_text(inv, "BILLEDQTY")
             rate_text = direct_child_text(inv, "RATE")
-            qty_val = to_float(qty_text)
+            qty_val = abs(to_float(qty_text))
             rate_val = to_float(rate_text)
+            
             batch_nodes = direct_children(inv, "BATCHALLOCATIONS.LIST")
             godown = ""
             batch = ""
@@ -577,10 +578,10 @@ def parse_inventory_entries(root, company):
                 "Date": v_date,
                 "VoucherTypeName": v_type,
                 "VoucherNumber": v_number,
-                "StockItemName": item_name,
-                "BilledQty": qty_val,
+                "StockItemName": item_name.strip(),
+                "BilledQty": qty_val if is_inward else -qty_val,
                 "Rate": rate_val,
-                "Amount": float(amount_val),
+                "Amount": float(amount_val if is_inward else -amount_val),
                 "GodownName": godown,
                 "BatchName": batch,
                 "VoucherNarration": v_narration,
