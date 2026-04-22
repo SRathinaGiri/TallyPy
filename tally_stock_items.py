@@ -33,6 +33,30 @@ def clean_text(text):
     text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", str(text))
     return text.strip()
 
+def xml_cleanup(xml_text):
+    def fix_char_ref(match):
+        value = match.group(1)
+        try:
+            codepoint = int(value[1:], 16) if value.lower().startswith("x") else int(value)
+        except Exception:
+            return ""
+        if codepoint in (9, 10, 13) or (32 <= codepoint <= 55295) or (57344 <= codepoint <= 65533) or (65536 <= codepoint <= 1114111):
+            return match.group(0)
+        return ""
+
+    xml_text = re.sub(r"&#(x[0-9A-Fa-f]+|\d+);", fix_char_ref, xml_text)
+    xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", xml_text)
+    xml_text = re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", xml_text)
+
+    # Strip namespace prefixes from tags (e.g., <ns0:TAG> -> <TAG>)
+    xml_text = re.sub(r"<(/?)[A-Za-z_][\w.-]*:([A-Za-z_][\w.-]*)", r"<\1\2", xml_text)
+
+    # Strip xmlns declarations to avoid parsing conflicts
+    xml_text = re.sub(r'\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*"[^"]*"', "", xml_text)
+    xml_text = re.sub(r"\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*'[^']*'", "", xml_text)
+
+    return xml_text
+
 def cn(text):
     """Clean numeric strings from Tally XML (handles commas, signs, and Dr/Cr suffixes)"""
     if not text: return 0.0
@@ -63,9 +87,7 @@ def get_company_info(host, port):
     )
     try:
         r = requests.post(url, data=xml.encode("utf-8"), timeout=15)
-        # Using standardized cleanup logic
-        from xml.sax.saxutils import escape
-        root = ET.fromstring(r.text.encode("utf-8")) # Stock items script had simpler cleanup
+        root = ET.fromstring(xml_cleanup(r.text).encode("utf-8"))
         cmp = root.find(".//COMPANY")
         if cmp is not None:
             name = clean_text(cmp.get("NAME")) or clean_text(cmp.findtext("NAME", ""))
@@ -97,7 +119,7 @@ xml_req = (
 )
 
 xml_resp = post_to_tally(url, xml_req)
-root = ET.fromstring(xml_resp.encode("utf-8"))
+root = ET.fromstring(xml_cleanup(xml_resp).encode("utf-8"))
 
 rows = []
 for elem in root.findall(".//STOCKITEM"):

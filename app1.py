@@ -18,32 +18,29 @@ ACCOUNTING_VOUCHER_TYPES = {
     "Payment",
     "Debit Note",
     "Credit Note",
+    "Contra",
 }
 
+# 15 Primary + 13 Sub-groups from Tally documentation
 BS_PRIMARY_GROUPS = {
-    "Bank Accounts",
-    "Bank OD A/c",
-    "Capital Account",
-    "Cash-in-Hand",
-    "Current Assets",
-    "Deposits (Asset)",
+    "Capital Account", "Reserves & Surplus",
+    "Loans (Liability)", "Bank OD A/c", "Secured Loans", "Unsecured Loans",
+    "Current Liabilities", "Duties & Taxes", "Provisions", "Sundry Creditors",
     "Fixed Assets",
     "Investments",
-    "Loans & Advances (Asset)",
-    "Loans (Liability)",
-    "Provisions",
-    "Secured Loans",
-    "Sundry Creditors",
-    "Sundry Debtors",
+    "Current Assets", "Stock-in-hand", "Deposits (Asset)", "Loans & Advances (Asset)", "Bank Accounts", "Cash-in-hand", "Sundry Debtors",
+    "Misc. Expenses (ASSET)",
+    "Suspense Account",
+    "Branch / Divisions",
 }
 
 PL_PRIMARY_GROUPS = {
-    "Direct Expenses",
-    "Duties & Taxes",
-    "Indirect Expenses",
-    "Indirect Incomes",
-    "Purchase Accounts",
     "Sales Accounts",
+    "Purchase Accounts",
+    "Direct Incomes",
+    "Indirect Incomes",
+    "Direct Expenses",
+    "Indirect Expenses",
 }
 
 PRIMARY_GROUPS = BS_PRIMARY_GROUPS | PL_PRIMARY_GROUPS
@@ -71,6 +68,7 @@ CURRENCY_SYMBOL_FALLBACKS = {
 VOUCHER_COLUMNS = [
     "Date",
     "VoucherTypeName",
+    "BaseVoucherType",
     "VoucherNumber",
     "LedgerName",
     "MasterID",
@@ -80,6 +78,7 @@ VOUCHER_COLUMNS = [
     "CreditAmount",
     "ParentLedger",
     "PrimaryGroup",
+    "Nature",
     "PartyLedgerName",
     "PartyGSTIN",
     "LedgerGSTIN",
@@ -94,6 +93,7 @@ LEDGER_COLUMNS = [
     "MasterID",
     "Name",
     "PrimaryGroup",
+    "Nature",
     "StartingFrom",
     "CurrencyName",
     "StateName",
@@ -160,6 +160,14 @@ def xml_cleanup(xml_text):
     xml_text = re.sub(r"&#(x[0-9A-Fa-f]+|\d+);", fix_char_ref, xml_text)
     xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", xml_text)
     xml_text = re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", xml_text)
+    
+    # Strip namespace prefixes from tags (e.g., <ns0:TAG> -> <TAG>)
+    xml_text = re.sub(r"<(/?)[A-Za-z_][\w.-]*:([A-Za-z_][\w.-]*)", r"<\1\2", xml_text)
+    
+    # Strip xmlns declarations to avoid parsing conflicts
+    xml_text = re.sub(r'\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*"[^"]*"', "", xml_text)
+    xml_text = re.sub(r"\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*'[^']*'", "", xml_text)
+        
     return xml_text
 
 
@@ -232,10 +240,23 @@ def format_tally_date(value):
 
 
 def nature_from_primary_group(primary_group):
-    if primary_group in BS_PRIMARY_GROUPS:
-        return "BS"
-    if primary_group in PL_PRIMARY_GROUPS:
-        return "PL"
+    pg = clean_text(primary_group).lower()
+    if pg in [
+        "current assets", "fixed assets", "investments", "misc. expenses (asset)",
+        "bank accounts", "cash-in-hand", "deposits (asset)", "loans & advances (asset)",
+        "stock-in-hand", "sundry debtors"
+    ]:
+        return "Assets"
+    elif pg in [
+        "capital account", "current liabilities", "loans (liability)", "suspense account",
+        "branch / divisions", "bank od a/c", "duties & taxes", "provisions",
+        "reserves & surplus", "secured loans", "sundry creditors", "unsecured loans"
+    ]:
+        return "Liabilities"
+    elif pg in ["direct incomes", "indirect incomes", "sales accounts"]:
+        return "Income"
+    elif pg in ["direct expenses", "indirect expenses", "purchase accounts"]:
+        return "Expenses"
     return "Unknown"
 
 
@@ -384,9 +405,12 @@ def build_inventory_entries_request_xml(company, from_date, to_date):
     )
 
 
-def parse_ledgers(root):
+def parse_ledgers(root, group_map=None):
     ledger_rows = []
     ledger_lookup = {}
+    
+    if group_map is None:
+        group_map = {}
 
     for elem in root.iter():
         if strip_ns(elem.tag).upper() != "LEDGER":
@@ -396,17 +420,26 @@ def parse_ledgers(root):
         if not name:
             continue
 
+        parent = direct_child_text(elem, "PARENT")
+        
+        # Use group_map to get Nature and PrimaryGroup if available
+        # Otherwise fallback to pre-defined logic or empty
+        g_info = group_map.get(parent, {})
+        nature = g_info.get("Nature", "")
+        primary_group = g_info.get("PrimaryGroup", "") or first_non_empty_text(elem, ["PRIMARYGROUP"]) or first_descendant_text(elem, "PRIMARYGROUP")
+
         row = {
             "MasterID": clean_text(elem.get("MASTERID")) or direct_child_text(elem, "MASTERID"),
             "Name": name,
-            "PrimaryGroup": first_non_empty_text(elem, ["PRIMARYGROUP"]) or first_descendant_text(elem, "PRIMARYGROUP"),
+            "PrimaryGroup": primary_group,
+            "Nature": nature,
             "StartingFrom": first_non_empty_text(elem, ["STARTINGFROM"]) or first_descendant_text(elem, "STARTINGFROM"),
             "CurrencyNameRaw": first_non_empty_text(elem, ["CURRENCYNAME"]) or first_descendant_text(elem, "CURRENCYNAME"),
             "CurrencyFormalNameRaw": first_non_empty_text(elem, ["CURRENCYFORMALNAME"]) or first_descendant_text(elem, "CURRENCYFORMALNAME"),
             "CurrencySymbolRaw": first_non_empty_text(elem, ["CURRENCYSYMBOL"]) or first_descendant_text(elem, "CURRENCYSYMBOL"),
             "CurrencyOriginalSymbolRaw": first_non_empty_text(elem, ["CURRENCYORIGINALSYMBOL"]) or first_descendant_text(elem, "CURRENCYORIGINALSYMBOL"),
             "StateName": first_non_empty_text(elem, ["STATENAME"]) or first_descendant_text(elem, "STATENAME"),
-            "Parent": direct_child_text(elem, "PARENT"),
+            "Parent": parent,
             "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"]) or first_descendant_text(elem, "PARTYGSTIN"),
             "OpeningBalance": to_float(first_non_empty_text(elem, ["OPENINGBALANCE"]) or first_descendant_text(elem, "OPENINGBALANCE")),
             "ClosingBalance": to_float(first_non_empty_text(elem, ["CLOSINGBALANCE"]) or first_descendant_text(elem, "CLOSINGBALANCE")),
@@ -418,6 +451,15 @@ def parse_ledgers(root):
     for row in ledger_rows:
         if not row["PrimaryGroup"]:
             row["PrimaryGroup"] = ledger_primary_group(row["Name"], ledger_lookup)
+        
+        # If nature is still empty, try to resolve it from the PrimaryGroup
+        if not row["Nature"] and row["PrimaryGroup"]:
+             pg_info = group_map.get(row["PrimaryGroup"], {})
+             row["Nature"] = pg_info.get("Nature", "")
+             
+        if not row["Nature"] and row["PrimaryGroup"]:
+            # Last fallback for Nature if not in group_map
+            row["Nature"] = nature_from_primary_group(row["PrimaryGroup"])
 
         currency_key = clean_text(row.get("CurrencyFormalNameRaw") or row.get("CurrencyNameRaw")).upper()
         row["CurrencyName"] = CURRENCY_SYMBOL_FALLBACKS.get(currency_key, clean_text(row.get("CurrencySymbolRaw") or row.get("CurrencyOriginalSymbolRaw")))
@@ -428,17 +470,23 @@ def parse_ledgers(root):
     return output_rows
 
 
-def parse_vouchers(root, ledger_meta, company, from_date, to_date):
+def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=None):
     rows = []
     formatted_from_date = format_tally_date(from_date)
     formatted_to_date = format_tally_date(to_date)
+    
+    if vtype_map is None:
+        vtype_map = {}
 
     for voucher in root.iter():
         if strip_ns(voucher.tag).upper() != "VOUCHER":
             continue
 
         voucher_type = direct_child_text(voucher, "VOUCHERTYPENAME")
-        if voucher_type not in ACCOUNTING_VOUCHER_TYPES:
+        base_v_type = vtype_map.get(voucher_type, voucher_type)
+        
+        # We filter based on the BASE voucher type now
+        if base_v_type not in ACCOUNTING_VOUCHER_TYPES:
             continue
 
         voucher_date = format_tally_date(direct_child_text(voucher, "DATE"))
@@ -472,6 +520,7 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date):
             parent_ledger = meta.get("Parent", "")
             ledger_gstin = meta.get("PartyGSTIN", "")
             ledger_master_id = meta.get("MasterID", "")
+            nature = meta.get("Nature", "")
 
             entry_level_master_id = direct_child_text(entry, "ENTRYLEDGERMASTERID")
             entry_level_parent = direct_child_text(entry, "ENTRYPARENTLEDGER")
@@ -490,6 +539,7 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date):
             rows.append({
                 "Date": voucher_date,
                 "VoucherTypeName": voucher_type,
+                "BaseVoucherType": base_v_type,
                 "VoucherNumber": voucher_number,
                 "LedgerName": ledger_name,
                 "MasterID": ledger_master_id,
@@ -499,6 +549,7 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date):
                 "CreditAmount": float(credit_amount),
                 "ParentLedger": parent_ledger,
                 "PrimaryGroup": primary_group,
+                "Nature": nature,
                 "PartyLedgerName": party_ledger_name,
                 "PartyGSTIN": voucher_gstin,
                 "LedgerGSTIN": ledger_gstin,
@@ -616,6 +667,83 @@ def get_company_info(host, port):
     return "", "", ""
 
 
+def fetch_tally_metadata(url, company):
+    static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
+    if company:
+        static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
+    
+    # 1. Fetch Voucher Types
+    vtype_xml = (
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
+        "<TYPE>COLLECTION</TYPE><ID>AllVoucherTypes</ID></HEADER><BODY><DESC>"
+        f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
+        "<TDL><TDLMESSAGE>"
+        "<COLLECTION NAME=\"AllVoucherTypes\"><TYPE>VoucherType</TYPE><FETCH>Name, Parent</FETCH></COLLECTION>"
+        "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    )
+    
+    # 2. Fetch Groups
+    group_xml = (
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
+        "<TYPE>COLLECTION</TYPE><ID>AllGroups</ID></HEADER><BODY><DESC>"
+        f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
+        "<TDL><TDLMESSAGE>"
+        "<COLLECTION NAME=\"AllGroups\"><TYPE>Group</TYPE><FETCH>Name, Parent, Nature, _PrimaryGroup</FETCH></COLLECTION>"
+        "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    )
+    
+    vtype_map = {}
+    group_map = {}
+    
+    try:
+        # Request 1
+        resp_v = post_to_tally(url, vtype_xml)
+        root_v = parse_xml_root(resp_v)
+        for vt in root_v.iter():
+            if strip_ns(vt.tag).upper() == "VOUCHERTYPE":
+                name = direct_child_text(vt, "NAME")
+                parent = direct_child_text(vt, "PARENT")
+                if name:
+                    vtype_map[name] = parent or name
+        
+        # Request 2
+        resp_g = post_to_tally(url, group_xml)
+        root_g = parse_xml_root(resp_g)
+        for g in root_g.iter():
+            if strip_ns(g.tag).upper() == "GROUP":
+                name = direct_child_text(g, "NAME")
+                parent = direct_child_text(g, "PARENT")
+                nature = direct_child_text(g, "NATURE")
+                primary = direct_child_text(g, "_PRIMARYGROUP")
+                if name:
+                    group_map[name] = {
+                        "Parent": parent,
+                        "Nature": nature,
+                        "PrimaryGroup": primary
+                    }
+        
+        # Resolve Voucher Types recursively
+        base_types = {"Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra", "Stock Journal"}
+        for _ in range(5):
+            for vt_name, parent_name in vtype_map.items():
+                if parent_name and parent_name not in base_types and parent_name in vtype_map:
+                    vtype_map[vt_name] = vtype_map[parent_name]
+
+        # Resolve Group nature recursively
+        for _ in range(5):
+            for g_name, g_info in group_map.items():
+                parent = g_info.get("Parent")
+                if parent and not g_info.get("Nature") and parent in group_map:
+                    g_info["Nature"] = group_map[parent].get("Nature")
+                if parent and not g_info.get("PrimaryGroup") and parent in group_map:
+                    g_info["PrimaryGroup"] = group_map[parent].get("PrimaryGroup")
+
+    except:
+        pass
+        
+    return vtype_map, group_map
+
+
 @st.cache_data(show_spinner=False)
 def load_tally_data(host, port, company, from_date, to_date):
     url = f"http://{host}:{port}"
@@ -630,8 +758,10 @@ def load_tally_data(host, port, company, from_date, to_date):
         if not to_date:
             to_date = cmp_end
 
+    vtype_map, group_map = fetch_tally_metadata(url, selected_company)
+
     ledger_root = parse_xml_root(post_to_tally(url, build_ledger_request_xml(selected_company)))
-    ledger_rows = parse_ledgers(ledger_root)
+    ledger_rows = parse_ledgers(ledger_root, group_map)
     ledger_meta = {row["Name"]: row for row in ledger_rows}
 
     voucher_root = parse_xml_root(post_to_tally(url, build_voucher_request_xml(selected_company, from_date, to_date)))
@@ -640,7 +770,7 @@ def load_tally_data(host, port, company, from_date, to_date):
         error_text = first_descendant_text(voucher_root, "LINEERROR") or "Tally returned STATUS=0"
         raise ValueError(error_text)
 
-    voucher_rows = parse_vouchers(voucher_root, ledger_meta, selected_company, from_date, to_date)
+    voucher_rows = parse_vouchers(voucher_root, ledger_meta, selected_company, from_date, to_date, vtype_map)
     
     # New Stock Data
     stock_item_root = parse_xml_root(post_to_tally(url, build_stock_item_request_xml(selected_company)))

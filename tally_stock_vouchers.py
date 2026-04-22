@@ -22,11 +22,19 @@ def xml_cleanup(xml_text):
     xml_text = re.sub(r"&#(x[0-9A-Fa-f]+|\d+);", fix_char_ref, xml_text)
     xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", xml_text)
     xml_text = re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", xml_text)
+    
+    # Strip namespace prefixes from tags (e.g., <ns0:TAG> -> <TAG>)
+    xml_text = re.sub(r"<(/?)[A-Za-z_][\w.-]*:([A-Za-z_][\w.-]*)", r"<\1\2", xml_text)
+    
+    # Strip xmlns declarations to avoid parsing conflicts
+    xml_text = re.sub(r'\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*"[^"]*"', "", xml_text)
+    xml_text = re.sub(r"\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*'[^']*'", "", xml_text)
+        
     return xml_text
 
-def post_to_tally(xml):
+def post_to_tally(url, xml):
     try:
-        r = requests.post(f"http://{HOST}:{PORT}", data=xml.encode("utf-8"), timeout=60)
+        r = requests.post(url, data=xml.encode("utf-8"), timeout=60)
         r.raise_for_status()
         return r.text
     except Exception as e: return ""

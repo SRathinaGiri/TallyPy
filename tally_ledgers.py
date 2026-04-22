@@ -14,6 +14,7 @@ LEDGER_OUTPUT_COLUMNS = [
     "MasterID",
     "Name",
     "PrimaryGroup",
+    "Nature",
     "StartingFrom",
     "CurrencyName",
     "StateName",
@@ -23,30 +24,25 @@ LEDGER_OUTPUT_COLUMNS = [
     "ClosingBalance",
 ]
 
+# 15 Primary + 13 Sub-groups from Tally documentation
 BS_PRIMARY_GROUPS = {
-    "Bank Accounts",
-    "Bank OD A/c",
-    "Capital Account",
-    "Cash-in-Hand",
-    "Current Assets",
-    "Deposits (Asset)",
-    "Fixed Assets",
-    "Investments",
-    "Loans & Advances (Asset)",
-    "Loans (Liability)",
-    "Provisions",
-    "Secured Loans",
-    "Sundry Creditors",
-    "Sundry Debtors",
+    "Capital Account", "Reserves & Surplus",
+    "Loans (Liability)", "Bank OD A/c", "Secured Loans", "Unsecured Loans",
+    "Current Liabilities", "Duties & Taxes", "Provisions", "Sundry Creditors",
+    "Fixed Assets", "Investments",
+    "Current Assets", "Stock-in-hand", "Deposits (Asset)", "Loans & Advances (Asset)", "Bank Accounts", "Cash-in-hand", "Sundry Debtors",
+    "Misc. Expenses (ASSET)",
+    "Suspense Account",
+    "Branch / Divisions",
 }
 
 PL_PRIMARY_GROUPS = {
-    "Direct Expenses",
-    "Duties & Taxes",
-    "Indirect Expenses",
-    "Indirect Incomes",
-    "Purchase Accounts",
     "Sales Accounts",
+    "Purchase Accounts",
+    "Direct Incomes",
+    "Indirect Incomes",
+    "Direct Expenses",
+    "Indirect Expenses",
 }
 
 PRIMARY_GROUPS = BS_PRIMARY_GROUPS | PL_PRIMARY_GROUPS
@@ -113,6 +109,14 @@ def xml_cleanup(xml_text):
     xml_text = re.sub(r"&#(x[0-9A-Fa-f]+|\d+);", fix_char_ref, xml_text)
     xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", xml_text)
     xml_text = re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", xml_text)
+
+    # Strip namespace prefixes from tags (e.g., <ns0:TAG> -> <TAG>)
+    xml_text = re.sub(r"<(/?)[A-Za-z_][\w.-]*:([A-Za-z_][\w.-]*)", r"<\1\2", xml_text)
+
+    # Strip xmlns declarations to avoid parsing conflicts
+    xml_text = re.sub(r'\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*"[^"]*"', "", xml_text)
+    xml_text = re.sub(r"\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*'[^']*'", "", xml_text)
+
     return xml_text
 
 
@@ -175,6 +179,27 @@ def detect_company_name(root):
     return ""
 
 
+def nature_from_primary_group(primary_group):
+    pg = clean_text(primary_group).lower()
+    if pg in [
+        "current assets", "fixed assets", "investments", "misc. expenses (asset)",
+        "bank accounts", "cash-in-hand", "deposits (asset)", "loans & advances (asset)",
+        "stock-in-hand", "sundry debtors"
+    ]:
+        return "Assets"
+    elif pg in [
+        "capital account", "current liabilities", "loans (liability)", "suspense account",
+        "branch / divisions", "bank od a/c", "duties & taxes", "provisions",
+        "reserves & surplus", "secured loans", "sundry creditors", "unsecured loans"
+    ]:
+        return "Liabilities"
+    elif pg in ["direct incomes", "indirect incomes", "sales accounts"]:
+        return "Income"
+    elif pg in ["direct expenses", "indirect expenses", "purchase accounts"]:
+        return "Expenses"
+    return "Unknown"
+
+
 def ledger_primary_group(ledger_name, ledger_meta):
     seen = set()
     current = clean_text(ledger_name)
@@ -211,6 +236,49 @@ def build_company_request_xml():
     )
 
 
+def fetch_tally_metadata(url, company):
+    static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
+    if company:
+        static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
+    
+    xml = (
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
+        "<TYPE>COLLECTION</TYPE><ID>MetadataFetch</ID></HEADER><BODY><DESC>"
+        f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
+        "<TDL><TDLMESSAGE>"
+        "<COLLECTION NAME=\"AllGroups\"><TYPE>Group</TYPE><FETCH>Name, Parent, Nature, _PrimaryGroup</FETCH></COLLECTION>"
+        "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    )
+    
+    group_map = {}
+    try:
+        resp = post_to_tally(url, xml)
+        root = parse_xml_root(resp)
+        for g in root.iter():
+            if strip_ns(g.tag).upper() == "GROUP":
+                name = direct_child_text(g, "NAME")
+                parent = direct_child_text(g, "PARENT")
+                nature = direct_child_text(g, "NATURE")
+                primary = direct_child_text(g, "_PRIMARYGROUP")
+                if name:
+                    group_map[name] = {
+                        "Parent": parent,
+                        "Nature": nature,
+                        "PrimaryGroup": primary
+                    }
+        # Resolve Group nature recursively if missing
+        for _ in range(5):
+            for g_name, g_info in group_map.items():
+                parent = g_info.get("Parent")
+                if parent and not g_info.get("Nature") and parent in group_map:
+                    g_info["Nature"] = group_map[parent].get("Nature")
+                if parent and not g_info.get("PrimaryGroup") and parent in group_map:
+                    g_info["PrimaryGroup"] = group_map[parent].get("PrimaryGroup")
+    except:
+        pass
+    return group_map
+
+
 def build_ledger_request_xml(company):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
@@ -232,9 +300,12 @@ def build_ledger_request_xml(company):
     )
 
 
-def parse_ledgers(root):
+def parse_ledgers(root, group_map=None):
     ledger_rows = []
     ledger_lookup = {}
+    if group_map is None:
+        group_map = {}
+        
     for elem in root.iter():
         if strip_ns(elem.tag).upper() != "LEDGER":
             continue
@@ -242,6 +313,11 @@ def parse_ledgers(root):
         name = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
         if not name:
             continue
+
+        parent = direct_child_text(elem, "PARENT")
+        g_info = group_map.get(parent, {})
+        nature = g_info.get("Nature", "")
+        primary_group = g_info.get("PrimaryGroup", "") or first_non_empty_text(elem, ["PRIMARYGROUP"]) or first_descendant_text(elem, "PRIMARYGROUP")
 
         row = {
             "MasterID": clean_text(elem.get("MASTERID")) or direct_child_text(elem, "MASTERID"),
@@ -252,11 +328,12 @@ def parse_ledgers(root):
             "CurrencyOriginalSymbolRaw": first_non_empty_text(elem, ["CURRENCYORIGINALSYMBOL"]) or first_descendant_text(elem, "CURRENCYORIGINALSYMBOL"),
             "CurrencyFormalNameRaw": first_non_empty_text(elem, ["CURRENCYFORMALNAME"]) or first_descendant_text(elem, "CURRENCYFORMALNAME"),
             "StateName": first_non_empty_text(elem, ["STATENAME"]) or first_descendant_text(elem, "STATENAME"),
-            "Parent": direct_child_text(elem, "PARENT"),
+            "Parent": parent,
             "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"]) or first_descendant_text(elem, "PARTYGSTIN"),
             "OpeningBalance": to_float(first_non_empty_text(elem, ["OPENINGBALANCE"]) or first_descendant_text(elem, "OPENINGBALANCE")),
             "ClosingBalance": to_float(first_non_empty_text(elem, ["CLOSINGBALANCE"]) or first_descendant_text(elem, "CLOSINGBALANCE")),
-            "PrimaryGroup": first_non_empty_text(elem, ["PRIMARYGROUP"]) or first_descendant_text(elem, "PRIMARYGROUP"),
+            "PrimaryGroup": primary_group,
+            "Nature": nature
         }
         ledger_rows.append(row)
         ledger_lookup[name] = row
@@ -264,6 +341,13 @@ def parse_ledgers(root):
     for row in ledger_rows:
         if not row["PrimaryGroup"]:
             row["PrimaryGroup"] = ledger_primary_group(row["Name"], ledger_lookup)
+        
+        pg = row["PrimaryGroup"]
+        if not row["Nature"] and pg:
+            row["Nature"] = group_map.get(pg, {}).get("Nature", "")
+            
+        if not row["Nature"] and pg:
+            row["Nature"] = nature_from_primary_group(pg)
 
     return ledger_rows
 
@@ -322,13 +406,15 @@ def fetch_ledger_rows(host, port, company):
         cmp_name, _, _ = get_company_info(host, port)
         company = cmp_name
 
+    group_map = fetch_tally_metadata(url, company)
+    
     ledger_root = parse_xml_root(post_to_tally(url, build_ledger_request_xml(company)))
     status = clean_text(first_descendant_text(ledger_root, "STATUS"))
     if status == "0":
         error_text = first_descendant_text(ledger_root, "LINEERROR") or "Tally returned STATUS=0 for ledger extract"
         raise ValueError(error_text)
 
-    ledger_rows = parse_ledgers(ledger_root)
+    ledger_rows = parse_ledgers(ledger_root, group_map)
     return build_ledger_rows(ledger_rows)
 
 
