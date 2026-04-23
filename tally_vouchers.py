@@ -22,7 +22,7 @@ BS_PRIMARY_GROUPS = {"Capital Account", "Reserves & Surplus", "Loans (Liability)
 PL_PRIMARY_GROUPS = {"Sales Accounts", "Purchase Accounts", "Direct Incomes", "Indirect Incomes", "Direct Expenses", "Indirect Expenses"}
 PRIMARY_GROUPS = BS_PRIMARY_GROUPS | PL_PRIMARY_GROUPS
 
-# Core Helpers (Line-for-line with app1.py)
+# Core Helper Functions (Line-for-line with app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -93,8 +93,7 @@ def get_company_info(host, port):
         cleaned = xml_cleanup(post_to_tally(url, xml))
         root = ET.fromstring(cleaned.encode("utf-8"))
         for cmp in root.iter():
-            if strip_ns(cmp.tag).upper() == "COMPANY":
-                return clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME"), direct_child_text(cmp, "STARTINGFROM"), direct_child_text(cmp, "ENDINGAT")
+            if strip_ns(cmp.tag).upper() == "COMPANY": return direct_child_text(cmp, "NAME"), direct_child_text(cmp, "STARTINGFROM"), direct_child_text(cmp, "ENDINGAT")
     except: pass
     return "", "", ""
 
@@ -127,7 +126,6 @@ def fetch_tally_metadata(url, company):
 
 # --- MAIN EXECUTION ---
 
-# Acquire Sequential Lock
 lock_file = os.path.join(tempfile.gettempdir(), f"tally_lock_{PORT}.lock")
 for _ in range(300):
     try:
@@ -156,13 +154,13 @@ try:
         rl = ET.fromstring(xml_cleanup(post_to_tally(url, l_req)))
         for elem in rl.iter():
             if strip_ns(elem.tag).upper() == "LEDGER":
-                name = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
-                if not name: continue
-                parent = direct_child_text(elem, "PARENT"); gi = g_map.get(parent, {})
+                n = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
+                if not n: continue
+                p = direct_child_text(elem, "PARENT"); gi = g_map.get(p, {})
                 pg = gi.get("PrimaryGroup") or direct_child_text(elem, "PRIMARYGROUP")
                 nog = gi.get("Nature", ""); nat = "BS" if nog and nog.lower() in ["assets", "liabilities"] else ("PL" if nog and nog.lower() in ["income", "expenses"] else "")
                 if not nat and pg: nat, nog = nature_from_primary_group(pg)
-                l_meta[name] = {"Name": name, "Parent": parent, "PrimaryGroup": pg, "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Nature": nat, "NatureOfGroup": nog, "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]), "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"])}
+                l_meta[n] = {"Name": n, "Parent": p, "PrimaryGroup": pg, "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Nature": nat, "NatureOfGroup": nog, "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]), "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"])}
 
         v_xml = (
             f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER><BODY><DESC>"
@@ -171,7 +169,9 @@ try:
             "<TDL><TDLMESSAGE><SYSTEM TYPE='Formulae' NAME='IsAccountingVoucher'>"
             "($VoucherTypeName = \"Sales\") OR ($VoucherTypeName = \"Purchase\") OR ($VoucherTypeName = \"Journal\") OR ($VoucherTypeName = \"Receipt\") OR ($VoucherTypeName = \"Payment\") OR ($VoucherTypeName = \"Debit Note\") OR ($VoucherTypeName = \"Credit Note\") OR ($VoucherTypeName = \"Contra\")</SYSTEM>"
             "<OBJECT NAME=\"All Ledger Entries\"><COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE><COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE><COMPUTE>EntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE><COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE></OBJECT>"
-            "<COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.*</FETCH><FILTER>IsAccountingVoucher</FILTER></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+            "<COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
+            "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
+            "<FILTER>IsAccountingVoucher</FILTER></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
         )
 
         root = ET.fromstring(xml_cleanup(post_to_tally(url, v_xml)))
@@ -186,7 +186,8 @@ try:
             for ent in entries:
                 ln = direct_child_text(ent, "LEDGERNAME"); amt_v = to_decimal(direct_child_text(ent, "AMOUNT"))
                 if not ln or amt_v == 0: continue
-                signed = abs(amt_v) * (Decimal("-1") if direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES" else Decimal("1"))
+                is_pos = direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES"
+                signed = abs(amt_v) * (Decimal("-1") if is_pos else Decimal("1"))
                 meta = l_meta.get(ln, {})
                 rows.append({"Date": vd, "VoucherTypeName": vt, "BaseVoucherType": base_vt, "VoucherNumber": vn, "LedgerName": ln, "MasterID": meta.get("MasterID", ""), "Amount": float(signed), "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0, "CreditAmount": float(abs(signed)) if signed > 0 else 0.0, "ParentLedger": meta.get("Parent", ""), "PrimaryGroup": meta.get("PrimaryGroup", ""), "Nature": meta.get("Nature", ""), "NatureOfGroup": meta.get("NatureOfGroup", ""), "PAN": meta.get("PAN", ""), "PartyLedgerName": direct_child_text(voucher, "PARTYLEDGERNAME"), "PartyGSTIN": direct_child_text(voucher, "PARTYGSTIN"), "LedgerGSTIN": meta.get("PartyGSTIN", ""), "VoucherNarration": v_nar, "IsOptional": is_opt, "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
         Journal = pd.DataFrame(rows, columns=VOUCHER_COLUMNS)
