@@ -4,7 +4,6 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 import os
 import time
-import pickle
 import tempfile
 from decimal import Decimal
 from xml.sax.saxutils import escape
@@ -102,14 +101,24 @@ def fetch_metadata(url, company):
     return vm, gm
 
 # Caching & Locking
-cache_file = os.path.join(tempfile.gettempdir(), f"tally_cache_{PORT}.pkl")
-lock_file = os.path.join(tempfile.gettempdir(), f"tally_lock_{PORT}.lock")
+cache_dir = tempfile.gettempdir()
+cache_files = {
+    'Journal': os.path.join(cache_dir, f"tally_Journal_{PORT}.csv"),
+    'Ledger': os.path.join(cache_dir, f"tally_Ledger_{PORT}.csv"),
+    'StockItem': os.path.join(cache_dir, f"tally_StockItem_{PORT}.csv"),
+    'StockVoucher': os.path.join(cache_dir, f"tally_StockVoucher_{PORT}.csv")
+}
+lock_file = os.path.join(cache_dir, f"tally_lock_{PORT}.lock")
 
 def get_data():
-    if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file)) < 300: # 5 min cache
-        try:
-            with open(cache_file, 'rb') as f: return pickle.load(f)
-        except: pass
+    # Check if all CSV files exist and are fresh (5 min)
+    all_exist = all(os.path.exists(f) for f in cache_files.values())
+    if all_exist:
+        mtimes = [os.path.getmtime(f) for f in cache_files.values()]
+        if all((time.time() - mt) < 300 for mt in mtimes):
+            try:
+                return {name: pd.read_csv(f) for name, f in cache_files.items()}
+            except: pass
     
     # Try to acquire lock
     for _ in range(120): # Wait up to 2 minutes
@@ -122,12 +131,16 @@ def get_data():
                 try: os.remove(lock_file)
                 except: pass
             time.sleep(1)
-            # Check if cache was created while waiting
-            if os.path.exists(cache_file):
+            # Re-check cache while waiting
+            if all(os.path.exists(f) for f in cache_files.values()):
                 try:
-                    with open(cache_file, 'rb') as f: return pickle.load(f)
+                    return {name: pd.read_csv(f) for name, f in cache_files.items()}
                 except: pass
-    else: return None # Could not acquire lock
+    else:
+        # If lock couldn't be acquired, try one last time to read cache even if stale
+        if all(os.path.exists(f) for f in cache_files.values()):
+             return {name: pd.read_csv(f) for name, f in cache_files.items()}
+        return None
 
     try:
         url = f"http://{HOST}:{PORT}"
@@ -206,9 +219,13 @@ def get_data():
             if strip_ns(elem.tag).upper() != "STOCKITEM": continue
             si_rows.append({"Name": clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME"), "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": float(to_decimal(direct_child_text(elem, "OPENINGBALANCE"))), "OpeningValue": float(to_decimal(direct_child_text(elem, "OPENINGVALUE"))), "BasicValue": float(to_decimal(direct_child_text(elem, "BASICVALUE"))), "BasicQty": float(to_decimal(direct_child_text(elem, "BASICQTY"))), "OpeningRate": float(to_decimal(direct_child_text(elem, "OPENINGRATE"))), "CompanyName": comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
         
-        final_data = {'Journal': pd.DataFrame(v_rows), 'Ledger': l_df, 'StockItem': pd.DataFrame(si_rows), 'StockVoucher': pd.DataFrame(sv_rows)}
-        with open(cache_file, 'wb') as f: pickle.dump(final_data, f)
-        return final_data
+        final_dfs = {'Journal': pd.DataFrame(v_rows), 'Ledger': l_df, 'StockItem': pd.DataFrame(si_rows), 'StockVoucher': pd.DataFrame(sv_rows)}
+        
+        # Save to CSVs
+        for name, df in final_dfs.items():
+            df.to_csv(cache_files[name], index=False)
+            
+        return final_dfs
     finally:
         try: os.remove(lock_file)
         except: pass
