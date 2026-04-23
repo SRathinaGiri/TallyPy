@@ -47,6 +47,9 @@ def to_decimal(value, default=Decimal("0.00")):
     try: return Decimal(matches[-1].group(0))
     except: return default
 
+def to_float(value):
+    return float(to_decimal(value))
+
 def format_tally_date(value):
     value = clean_text(value)
     if re.fullmatch(r"\d{8}", value): return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
@@ -59,11 +62,7 @@ def post_to_tally(url, xml_text, timeout=120):
 
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
-    xml = "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
-    xml += "<TYPE>COLLECTION</TYPE><ID>MyC</ID></HEADER><BODY><DESC><STATICVARIABLES>"
-    xml += "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE>"
-    xml += "<COLLECTION NAME=\"MyC\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH><FILTER>IsActiveCompany</FILTER></COLLECTION>"
-    xml += "<SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    xml = "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyC</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"MyC\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH><FILTER>IsActiveCompany</FILTER></COLLECTION><SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     try:
         root = ET.fromstring(xml_cleanup(post_to_tally(url, xml)))
         for cmp in root.iter():
@@ -80,9 +79,26 @@ si_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQU
 
 root = ET.fromstring(xml_cleanup(post_to_tally(url, si_req)))
 si_rows = []
-for elem in root.iter():
-    if strip_ns(elem.tag).upper() == "STOCKITEM":
-        si_rows.append({"Name": clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME"), "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": float(to_decimal(direct_child_text(elem, "OPENINGBALANCE"))), "OpeningValue": float(to_decimal(direct_child_text(elem, "OPENINGVALUE"))), "BasicValue": float(to_decimal(direct_child_text(elem, "BASICVALUE"))), "BasicQty": float(to_decimal(direct_child_text(elem, "BASICQTY"))), "OpeningRate": float(to_decimal(direct_child_text(elem, "OPENINGRATE"))), "ClosingBalance": float(to_decimal(direct_child_text(elem, "CLOSINGBALANCE"))), "ClosingValue": float(to_decimal(direct_child_text(elem, "CLOSINGVALUE"))), "ClosingRate": float(to_decimal(direct_child_text(elem, "CLOSINGRATE"))), "CompanyName": sel_comp, "FromDate": format_tally_date(det_start), "ToDate": format_tally_date(det_end)})
+for elem in root.findall(".//STOCKITEM"):
+    name = clean_text(elem.get("NAME")) or elem.findtext("NAME", "")
+    if not name: continue
+    si_rows.append({
+        "Name": name,
+        "Parent": elem.findtext("PARENT", ""),
+        "Category": elem.findtext("CATEGORY", ""),
+        "LedgerName": elem.findtext("LEDGERNAME", ""),
+        "OpeningBalance": to_float(elem.findtext("OPENINGBALANCE", "0")),
+        "OpeningValue": to_float(elem.findtext("OPENINGVALUE", "0")),
+        "BasicValue": to_float(elem.findtext("BASICVALUE", "0")),
+        "BasicQty": to_float(elem.findtext("BASICQTY", "0")),
+        "OpeningRate": to_float(elem.findtext("OPENINGRATE", "0")),
+        "ClosingBalance": to_float(elem.findtext("CLOSINGBALANCE", "0")),
+        "ClosingValue": to_float(elem.findtext("CLOSINGVALUE", "0")),
+        "ClosingRate": to_float(elem.findtext("CLOSINGRATE", "0")),
+        "CompanyName": sel_comp,
+        "FromDate": format_tally_date(det_start),
+        "ToDate": format_tally_date(det_end)
+    })
 
 StockItem = pd.DataFrame(si_rows, columns=STOCK_ITEM_COLUMNS)
 StockItem = StockItem[STOCK_ITEM_COLUMNS]

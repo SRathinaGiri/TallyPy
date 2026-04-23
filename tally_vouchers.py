@@ -66,6 +66,14 @@ def format_tally_date(value):
     if re.fullmatch(r"\d{8}", value): return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
     return value
 
+def nature_from_primary_group(primary_group):
+    pg = clean_text(primary_group).lower()
+    if pg in ["current assets", "fixed assets", "investments", "misc. expenses (asset)", "bank accounts", "cash-in-hand", "deposits (asset)", "loans & advances (asset)", "stock-in-hand", "sundry debtors"]: return "BS", "Assets"
+    elif pg in ["capital account", "current liabilities", "loans (liability)", "suspense account", "branch / divisions", "bank od a/c", "duties & taxes", "provisions", "reserves & surplus", "secured loans", "sundry creditors", "unsecured loans"]: return "BS", "Liabilities"
+    elif pg in ["direct incomes", "indirect incomes", "sales accounts"]: return "PL", "Income"
+    elif pg in ["direct expenses", "indirect expenses", "purchase accounts"]: return "PL", "Expenses"
+    return "Unknown", "Unknown"
+
 def post_to_tally(url, xml_text, timeout=120):
     r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=timeout)
     r.raise_for_status()
@@ -138,10 +146,14 @@ try:
             name = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
             if not name: continue
             parent = direct_child_text(elem, "PARENT"); gi = g_map.get(parent, {})
-            l_meta[name] = {"Name": name, "Parent": parent, "PrimaryGroup": gi.get("PrimaryGroup") or direct_child_text(elem, "PRIMARYGROUP"), "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Nature": gi.get("Nature", ""), "NatureOfGroup": gi.get("Nature", ""), "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]), "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"])}
+            pg = gi.get("PrimaryGroup") or direct_child_text(elem, "PRIMARYGROUP")
+            nog = gi.get("Nature", "")
+            nat = "BS" if nog and nog.lower() in ["assets", "liabilities"] else ("PL" if nog and nog.lower() in ["income", "expenses"] else "")
+            if not nat and pg: nat, nog = nature_from_primary_group(pg)
+            l_meta[name] = {"Name": name, "Parent": parent, "PrimaryGroup": pg, "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Nature": nat, "NatureOfGroup": nog, "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]), "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"])}
 except: pass
 
-# Fetch Vouchers (One shot as requested to match app1.py)
+# Fetch Vouchers
 root = ET.fromstring(xml_cleanup(post_to_tally(url, build_voucher_request_xml(sel_comp, f_dt, t_dt))))
 rows = []
 for v in root.iter():
@@ -159,4 +171,7 @@ for v in root.iter():
         rows.append({"Date": vd, "VoucherTypeName": vtype, "BaseVoucherType": base_vt, "VoucherNumber": vn, "LedgerName": ln, "MasterID": meta.get("MasterID", ""), "Amount": float(signed), "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0, "CreditAmount": float(abs(signed)) if signed > 0 else 0.0, "ParentLedger": meta.get("Parent", ""), "PrimaryGroup": meta.get("PrimaryGroup", ""), "Nature": meta.get("Nature", ""), "NatureOfGroup": meta.get("NatureOfGroup", ""), "PAN": meta.get("PAN", ""), "PartyLedgerName": direct_child_text(v, "PARTYLEDGERNAME"), "PartyGSTIN": direct_child_text(v, "PARTYGSTIN"), "LedgerGSTIN": meta.get("PartyGSTIN", ""), "VoucherNarration": v_nar, "IsOptional": direct_child_text(v, "ISOPTIONAL"), "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
 
 Journal = pd.DataFrame(rows, columns=VOUCHER_COLUMNS)
+Journal['CompanyName'] = sel_comp
+Journal['FromDate'] = format_tally_date(f_dt)
+Journal['ToDate'] = format_tally_date(t_dt)
 Journal = Journal[VOUCHER_COLUMNS]

@@ -15,7 +15,7 @@ COMPANY = ""      # Leave blank to auto-detect
 BS_PRIMARY_GROUPS = {"Capital Account", "Reserves & Surplus", "Loans (Liability)", "Bank OD A/c", "Secured Loans", "Unsecured Loans", "Current Liabilities", "Duties & Taxes", "Provisions", "Sundry Creditors", "Fixed Assets", "Investments", "Current Assets", "Stock-in-hand", "Deposits (Asset)", "Loans & Advances (Asset)", "Bank Accounts", "Cash-in-hand", "Sundry Debtors", "Misc. Expenses (ASSET)", "Suspense Account", "Branch / Divisions"}
 PL_PRIMARY_GROUPS = {"Sales Accounts", "Purchase Accounts", "Direct Incomes", "Indirect Incomes", "Direct Expenses", "Indirect Expenses"}
 PRIMARY_GROUPS = BS_PRIMARY_GROUPS | PL_PRIMARY_GROUPS
-CURRENCY_SYMBOL_FALLBACKS = {"INR": "₹", "INDIAN RUPEE": "₹", "RUPEE": "₹", "RUPEES": "₹", "RS": "₹", "RS.": "₹", "USD": "$", "US DOLLAR": "$", "DOLLAR": "$", "EUR": "€", "EURO": "€", "GBP": "£", "POUND": "£", "POUND STERLING": "£", "AED": "د.إ", "DIRHAM": "د.إ", "": ""}
+CURRENCY_SYMBOL_FALLBACKS = {"INR": "₹", "INDIAN RUPEE": "₹", "RUPEE": "₹", "RUPEES": "₹", "RS": "₹", "RS.": "₹", "USD": "$", "US DOLLAR": "$", "DOLLAR": "$", "EUR": "€", "EURO": "€", "GBP": "£", "POUND": "£", "POUND STERLING": "£", "AED": "د.இ", "DIRHAM": "د.இ", "": ""}
 
 LEDGER_COLUMNS = ["MasterID", "Name", "PrimaryGroup", "Nature", "NatureOfGroup", "PAN", "StartingFrom", "CurrencyName", "StateName", "Parent", "PartyGSTIN", "OpeningBalance", "ClosingBalance", "CompanyName", "FromDate", "ToDate"]
 
@@ -55,27 +55,13 @@ def first_non_empty_text(elem, names):
         if v: return v
     return ""
 
-def first_descendant_text(elem, local_name):
-    for child in elem.iter():
-        if strip_ns(child.tag).upper() == local_name.upper():
-            val = clean_text(child.text)
-            if val: return val
-    return ""
-
-def normalize_amount_text(value):
-    text = clean_text(value).replace(",", "")
-    if not text: return ""
-    matches = list(re.finditer(r"[-+]?\d+(?:\.\d+)?", text))
-    if not matches: return text
-    token = matches[-1].group(0)
-    try: return f"{Decimal(token):.2f}"
-    except InvalidOperation: return token
-
 def to_decimal(value, default=Decimal("0.00")):
-    value = normalize_amount_text(value)
-    if not value: return default
-    try: return Decimal(value)
-    except InvalidOperation: return default
+    text = clean_text(value).replace(",", "")
+    if not text: return default
+    matches = list(re.finditer(r"[-+]?\d+(?:\.\d+)?", text))
+    if not matches: return default
+    try: return Decimal(matches[-1].group(0))
+    except: return default
 
 def to_float(value):
     return float(to_decimal(value))
@@ -202,8 +188,7 @@ root = ET.fromstring(xml_cleanup(post_to_tally(url, build_ledger_request_xml(sel
 rows = parse_ledgers(root, group_map)
 
 Ledger = pd.DataFrame(rows, columns=LEDGER_COLUMNS)
-for row in Ledger.to_dict('records'): # Just to ensure we have the FY info
-    Ledger['CompanyName'] = sel_comp
-    Ledger['FromDate'] = format_tally_date(det_start)
-    Ledger['ToDate'] = format_tally_date(det_end)
+Ledger['CompanyName'] = sel_comp
+Ledger['FromDate'] = format_tally_date(det_start)
+Ledger['ToDate'] = format_tally_date(det_end)
 Ledger = Ledger[LEDGER_COLUMNS]
