@@ -491,9 +491,11 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=Non
             meta = ledger_meta.get(ledger_name, {})
             primary_group = meta.get("PrimaryGroup", "")
             parent_ledger = meta.get("Parent", "")
-            ledger_gstin = meta.get("GSTIN", "")
+            ledger_gstin = meta.get("PartyGSTIN", "")
             ledger_master_id = meta.get("MasterID", "")
             nature = meta.get("Nature", "")
+            nature_of_group = meta.get("NatureOfGroup", "")
+            pan = meta.get("PAN", "")
 
             entry_level_master_id = direct_child_text(entry, "ENTRYLEDGERMASTERID")
             entry_level_parent = direct_child_text(entry, "ENTRYPARENTLEDGER")
