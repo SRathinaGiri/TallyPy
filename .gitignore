@@ -22,3 +22,11 @@ definition/
 TMDLScripts/
 CaseStudy01.Report/
 CaseStudy01.SemanticModel/
+qt_tally_exporter/build/
+qt_tally_exporter/build2/
+qt_tally_exporter/dist/
+qt_tally_exporter/installer/stage/
+qt_tally_exporter/installer/config.txt
+qt_tally_exporter/installer/package.7z
+qt_tally_exporter/installer/package.sed
+qt_tally_exporterbuild/
