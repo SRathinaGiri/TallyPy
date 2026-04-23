@@ -2,7 +2,6 @@ import re
 import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
-import time
 from decimal import Decimal, InvalidOperation
 from xml.sax.saxutils import escape
 
@@ -13,7 +12,7 @@ COMPANY = ""      # Leave blank to auto-detect
 
 STOCK_ITEM_COLUMNS = ["Name", "Parent", "Category", "LedgerName", "OpeningBalance", "OpeningValue", "BasicValue", "BasicQty", "OpeningRate", "ClosingBalance", "ClosingValue", "ClosingRate", "CompanyName", "FromDate", "ToDate"]
 
-# Core Helper Functions (Line-for-line with app1.py)
+# Core Helpers (Line-for-line with app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -32,7 +31,6 @@ def xml_cleanup(xml_text):
     xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", xml_text)
     xml_text = re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", xml_text)
     xml_text = re.sub(r"<(/?)[A-Za-z_][\w.-]*:([A-Za-z_][\w.-]*)", r"<\1\2", xml_text)
-    xml_text = re.sub(r'\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*"[^"]*"', "", xml_text)
     return xml_text
 
 def direct_child_text(elem, local_name):
@@ -57,8 +55,7 @@ def format_tally_date(value):
     return value
 
 def post_to_tally(url, xml_text):
-    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120)
-    return r.text
+    return requests.post(url, data=xml_text.encode("utf-8"), timeout=120).text
 
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
@@ -70,44 +67,18 @@ def get_company_info(host, port):
     except: pass
     return "", "", ""
 
-# EXECUTION (Staggered start)
-time.sleep(2)
+# Execution Flow
 url = f"http://{HOST}:{PORT}"
 det_name, det_start, det_end = get_company_info(HOST, PORT)
 sel_comp = COMPANY or det_name
 
-si_req = (
-    f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyStockItems</ID></HEADER><BODY><DESC><STATICVARIABLES>"
-    f"<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE>"
-    f"<COLLECTION NAME=\"MyStockItems\"><TYPE>StockItem</TYPE>"
-    f"<FETCH>Name, Parent, Category, LedgerName, OpeningBalance, OpeningValue, BasicValue, BasicQty, OpeningRate</FETCH>"
-    f"<COMPUTE>ClosingBalance:$_ClosingBalance</COMPUTE><COMPUTE>ClosingValue:$_ClosingValue</COMPUTE><COMPUTE>ClosingRate:$_ClosingRate</COMPUTE>"
-    f"</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-)
+si_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MySI</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"MySI\"><TYPE>StockItem</TYPE><FETCH>Name, Parent, Category, LedgerName, OpeningBalance, OpeningValue, BasicValue, BasicQty, OpeningRate</FETCH><COMPUTE>ClosingBalance:$_ClosingBalance</COMPUTE><COMPUTE>ClosingValue:$_ClosingValue</COMPUTE><COMPUTE>ClosingRate:$_ClosingRate</COMPUTE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
 
 root = ET.fromstring(xml_cleanup(post_to_tally(url, si_req)))
 si_rows = []
 for elem in root.iter():
-    if strip_ns(elem.tag).upper() != "STOCKITEM": continue
-    name = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
-    if not name: continue
-    si_rows.append({
-        "Name": name,
-        "Parent": direct_child_text(elem, "PARENT"),
-        "Category": direct_child_text(elem, "CATEGORY"),
-        "LedgerName": direct_child_text(elem, "LEDGERNAME"),
-        "OpeningBalance": to_float(direct_child_text(elem, "OPENINGBALANCE")),
-        "OpeningValue": to_float(direct_child_text(elem, "OPENINGVALUE")),
-        "BasicValue": to_float(direct_child_text(elem, "BASICVALUE")),
-        "BasicQty": to_float(direct_child_text(elem, "BASICQTY")),
-        "OpeningRate": to_float(direct_child_text(elem, "OPENINGRATE")),
-        "ClosingBalance": to_float(direct_child_text(elem, "CLOSINGBALANCE")),
-        "ClosingValue": to_float(direct_child_text(elem, "CLOSINGVALUE")),
-        "ClosingRate": to_float(direct_child_text(elem, "CLOSINGRATE")),
-        "CompanyName": sel_comp,
-        "FromDate": format_tally_date(det_start),
-        "ToDate": format_tally_date(det_end)
-    })
+    if strip_ns(elem.tag).upper() == "STOCKITEM":
+        si_rows.append({"Name": clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME"), "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": to_float(direct_child_text(elem, "OPENINGBALANCE")), "OpeningValue": to_float(direct_child_text(elem, "OPENINGVALUE")), "BasicValue": to_float(direct_child_text(elem, "BASICVALUE")), "BasicQty": to_float(direct_child_text(elem, "BASICQTY")), "OpeningRate": to_float(direct_child_text(elem, "OPENINGRATE")), "ClosingBalance": to_float(direct_child_text(elem, "CLOSINGBALANCE")), "ClosingValue": to_float(direct_child_text(elem, "CLOSINGVALUE")), "ClosingRate": to_float(direct_child_text(elem, "CLOSINGRATE")), "CompanyName": sel_comp, "FromDate": format_tally_date(det_start), "ToDate": format_tally_date(det_end)})
 
 StockItem = pd.DataFrame(si_rows, columns=STOCK_ITEM_COLUMNS)
 StockItem = StockItem[STOCK_ITEM_COLUMNS]

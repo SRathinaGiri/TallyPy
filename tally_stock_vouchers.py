@@ -2,7 +2,6 @@ import re
 import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
-import time
 from decimal import Decimal, InvalidOperation
 from xml.sax.saxutils import escape
 from datetime import datetime
@@ -16,7 +15,7 @@ TO_DATE = ""      # YYYYMMDD
 
 STOCK_VOUCHER_COLUMNS = ["Date", "VoucherTypeName", "VoucherNumber", "StockItemName", "BilledQty", "Rate", "Amount", "GodownName", "BatchName", "VoucherNarration", "CompanyName", "FromDate", "ToDate"]
 
-# Core Helper Functions (Line-for-line with app1.py)
+# Core Helpers (Line-for-line with app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -35,16 +34,12 @@ def xml_cleanup(xml_text):
     xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", xml_text)
     xml_text = re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", xml_text)
     xml_text = re.sub(r"<(/?)[A-Za-z_][\w.-]*:([A-Za-z_][\w.-]*)", r"<\1\2", xml_text)
-    xml_text = re.sub(r'\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*"[^"]*"', "", xml_text)
     return xml_text
 
 def direct_child_text(elem, local_name):
     for child in list(elem):
         if strip_ns(child.tag).upper() == local_name.upper(): return clean_text(child.text)
     return ""
-
-def direct_children(elem, local_name):
-    return [c for c in list(elem) if strip_ns(c.tag).upper() == local_name.upper()]
 
 def first_non_empty_text(elem, names):
     for n in names:
@@ -69,8 +64,7 @@ def format_tally_date(value):
     return value
 
 def post_to_tally(url, xml_text):
-    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120)
-    return r.text
+    return requests.post(url, data=xml_text.encode("utf-8"), timeout=120).text
 
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
@@ -82,8 +76,7 @@ def get_company_info(host, port):
     except: pass
     return "", "", ""
 
-# EXECUTION (Staggered start)
-time.sleep(6)
+# Execution Flow
 url = f"http://{HOST}:{PORT}"
 det_name, det_start, det_end = get_company_info(HOST, PORT)
 sel_comp = COMPANY or det_name
@@ -111,16 +104,22 @@ for voucher in root.iter():
     v_narration = first_non_empty_text(voucher, ["NARRATION", "VOUCHERNARRATION"])
     v_company = first_non_empty_text(voucher, ["COMPANYNAME", "SVCURRENTCOMPANY"]) or sel_comp
 
-    # GREEDY SEARCH
+    # GREEDY SEARCH matching app1.py
     inv_nodes = [child for child in voucher if "INVENTORYENTRIES" in child.tag.upper()]
     for inv in inv_nodes:
         item_name = direct_child_text(inv, "STOCKITEMNAME")
         if not item_name: continue
-        is_inward = (direct_child_text(inv, "ISDEEMEDPOSITIVE").upper() == "YES")
+        is_pos_val = direct_child_text(inv, "ISDEEMEDPOSITIVE")
+        is_inward = (is_pos_val.upper() == "YES")
         q_val, a_val = abs(to_float(direct_child_text(inv, "BILLEDQTY"))), abs(to_float(direct_child_text(inv, "AMOUNT")))
-        batch_nodes = direct_children(inv, "BATCHALLOCATIONS.LIST")
-        gn, bn = (direct_child_text(batch_nodes[0], "GODOWNNAME"), direct_child_text(batch_nodes[0], "BATCHNAME")) if batch_nodes else ("", "")
-        sv_rows.append({"Date": v_date, "VoucherTypeName": v_type, "VoucherNumber": v_number, "StockItemName": item_name.strip(), "BilledQty": q_val if is_inward else -q_val, "Rate": to_float(direct_child_text(inv, "RATE")), "Amount": float(a_val if is_inward else -a_val), "GodownName": gn, "BatchName": bn, "VoucherNarration": v_narration, "CompanyName": v_company, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
+        
+        # BatchAllocations matching app1.py
+        batch_nodes = [c for c in list(inv) if "BATCHALLOCATIONS.LIST" in strip_ns(c.tag).upper()]
+        gn, bn = ("", "")
+        if batch_nodes:
+            gn, bn = direct_child_text(batch_nodes[0], "GODOWNNAME"), direct_child_text(batch_nodes[0], "BATCHNAME")
+        
+        sv_rows.append({"Date": v_date, "VoucherTypeName": v_type, "VoucherNumber": v_number, "StockItemName": item_name.strip(), "BilledQty": q_val if is_inward else -q_val, "Rate": to_float(direct_child_text(inv, "RATE")), "Amount": float(abs(a_val) if is_inward else -abs(a_val)), "GodownName": gn, "BatchName": bn, "VoucherNarration": v_narration, "CompanyName": v_company, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
 
 StockVoucher = pd.DataFrame(sv_rows, columns=STOCK_VOUCHER_COLUMNS)
 StockVoucher = StockVoucher[STOCK_VOUCHER_COLUMNS]

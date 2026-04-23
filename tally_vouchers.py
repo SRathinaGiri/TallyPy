@@ -2,10 +2,8 @@ import re
 import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
-import time
 from decimal import Decimal, InvalidOperation
 from xml.sax.saxutils import escape
-from datetime import datetime
 
 # Power BI / Tally configuration
 HOST = "localhost"
@@ -36,7 +34,6 @@ def xml_cleanup(xml_text):
     xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", xml_text)
     xml_text = re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", xml_text)
     xml_text = re.sub(r"<(/?)[A-Za-z_][\w.-]*:([A-Za-z_][\w.-]*)", r"<\1\2", xml_text)
-    xml_text = re.sub(r'\s+xmlns:[A-Za-z_][\w.-]*\s*=\s*"[^"]*"', "", xml_text)
     return xml_text
 
 def direct_child_text(elem, local_name):
@@ -69,31 +66,20 @@ def format_tally_date(value):
     if re.fullmatch(r"\d{8}", value): return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
     return value
 
-def nature_from_primary_group(pg):
-    pg = clean_text(pg).lower()
-    if pg in ["current assets", "fixed assets", "investments", "misc. expenses (asset)", "bank accounts", "cash-in-hand", "deposits (asset)", "loans & advances (asset)", "stock-in-hand", "sundry debtors"]: return "BS", "Assets"
-    elif pg in ["capital account", "current liabilities", "loans (liability)", "suspense account", "branch / divisions", "bank od a/c", "duties & taxes", "provisions", "reserves & surplus", "secured loans", "sundry creditors", "unsecured loans"]: return "BS", "Liabilities"
-    elif pg in ["direct incomes", "indirect incomes", "sales accounts"]: return "PL", "Income"
-    elif pg in ["direct expenses", "indirect expenses", "purchase accounts"]: return "PL", "Expenses"
-    return "Unknown", "Unknown"
-
 def post_to_tally(url, xml_text):
-    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120)
-    return r.text
+    return requests.post(url, data=xml_text.encode("utf-8"), timeout=120).text
 
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
     xml = "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyC</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"MyC\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH><FILTER>IsActiveCompany</FILTER></COLLECTION><SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     try:
-        cleaned = xml_cleanup(post_to_tally(url, xml))
-        root = ET.fromstring(cleaned.encode("utf-8"))
+        root = ET.fromstring(xml_cleanup(post_to_tally(url, xml)))
         for cmp in root.iter():
-            if strip_ns(cmp.tag).upper() == "COMPANY":
-                return clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME"), direct_child_text(cmp, "STARTINGFROM"), direct_child_text(cmp, "ENDINGAT")
+            if strip_ns(cmp.tag).upper() == "COMPANY": return direct_child_text(cmp, "NAME"), direct_child_text(cmp, "STARTINGFROM"), direct_child_text(cmp, "ENDINGAT")
     except: pass
     return "", "", ""
 
-def fetch_tally_metadata(url, company):
+def fetch_metadata(url, company):
     sv = f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>" if company else ""
     v_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>VT</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{sv}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"VT\"><TYPE>VoucherType</TYPE><FETCH>Name, Parent</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     g_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>GR</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{sv}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"GR\"><TYPE>Group</TYPE><FETCH>Name, Parent, Nature, _PrimaryGroup</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
@@ -120,40 +106,31 @@ def fetch_tally_metadata(url, company):
     except: pass
     return vm, gm
 
-# EXECUTION (Staggered start)
-time.sleep(4)
+# EXECUTION
 url = f"http://{HOST}:{PORT}"
 det_name, det_start, det_end = get_company_info(HOST, PORT)
 sel_comp = COMPANY or det_name
 f_dt, t_dt = FROM_DATE or det_start, TO_DATE or det_end
-v_map, g_map = fetch_tally_metadata(url, sel_comp)
+v_map, g_map = fetch_metadata(url, sel_comp)
 
-# Fetch Ledgers for meta
-l_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>LM</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"LM\"><TYPE>Ledger</TYPE><FETCH>Name, Parent, MasterID, PartyGSTIN, PAN, Incometaxnumber</FETCH><COMPUTE>PrimaryGroup:$_PrimaryGroup</COMPUTE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+# Ledger meta
+l_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>LM</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"LM\"><TYPE>Ledger</TYPE><FETCH>Name, Parent, MasterID, PartyGSTIN, PAN</FETCH><COMPUTE>PrimaryGroup:$_PrimaryGroup</COMPUTE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
 l_meta = {}
 try:
     rl = ET.fromstring(xml_cleanup(post_to_tally(url, l_req)))
     for elem in rl.iter():
         if strip_ns(elem.tag).upper() == "LEDGER":
-            name = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
-            if not name: continue
-            parent = direct_child_text(elem, "PARENT"); gi = g_map.get(parent, {})
-            pg = gi.get("PrimaryGroup") or direct_child_text(elem, "PRIMARYGROUP")
-            nog = gi.get("Nature", ""); nat = "BS" if nog and nog.lower() in ["assets", "liabilities"] else ("PL" if nog and nog.lower() in ["income", "expenses"] else "")
-            if not nat and pg: nat, nog = nature_from_primary_group(pg)
-            l_meta[name] = {"Name": name, "Parent": parent, "PrimaryGroup": pg, "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Nature": nat, "NatureOfGroup": nog, "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]), "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"])}
+            n = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
+            if not n: continue
+            p = direct_child_text(elem, "PARENT"); gi = g_map.get(p, {})
+            l_meta[n] = {"Name": n, "Parent": p, "PrimaryGroup": gi.get("PrimaryGroup") or direct_child_text(elem, "PRIMARYGROUP"), "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Nature": gi.get("Nature", ""), "NatureOfGroup": gi.get("Nature", ""), "PAN": first_non_empty_text(elem, ["PAN"]), "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"])}
 except: pass
 
 v_xml = (
-    f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER><BODY><DESC>"
+    f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>V</ID></HEADER><BODY><DESC>"
     f"<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY>"
     f"<SVFROMDATE TYPE='Date'>{escape(f_dt)}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(t_dt)}</SVTODATE></STATICVARIABLES>"
-    "<TDL><TDLMESSAGE><SYSTEM TYPE='Formulae' NAME='IsAccountingVoucher'>"
-    "($VoucherTypeName = \"Sales\") OR ($VoucherTypeName = \"Purchase\") OR ($VoucherTypeName = \"Journal\") OR ($VoucherTypeName = \"Receipt\") OR ($VoucherTypeName = \"Payment\") OR ($VoucherTypeName = \"Debit Note\") OR ($VoucherTypeName = \"Credit Note\") OR ($VoucherTypeName = \"Contra\")</SYSTEM>"
-    "<OBJECT NAME=\"All Ledger Entries\"><COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE><COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE><COMPUTE>EntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE><COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE></OBJECT>"
-    "<COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
-    "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
-    "<FILTER>IsAccountingVoucher</FILTER></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    "<TDL><TDLMESSAGE><COLLECTION NAME=\"V\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.*</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
 )
 
 root = ET.fromstring(xml_cleanup(post_to_tally(url, v_xml)))
