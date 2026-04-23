@@ -6,8 +6,9 @@ import os
 import time
 import pickle
 import tempfile
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from xml.sax.saxutils import escape
+from datetime import datetime, timedelta
 
 # Power BI / Tally configuration
 HOST = "localhost"
@@ -17,24 +18,7 @@ FROM_DATE = ""    # Leave blank for FY start (YYYYMMDD)
 TO_DATE = ""      # Leave blank for FY end (YYYYMMDD)
 
 # Mapping constants
-ACCOUNTING_VOUCHER_TYPES = {
-    "Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra",
-}
-
-BS_PRIMARY_GROUPS = {
-    "Capital Account", "Reserves & Surplus", "Loans (Liability)", "Bank OD A/c", "Secured Loans",
-    "Unsecured Loans", "Current Liabilities", "Duties & Taxes", "Provisions", "Sundry Creditors",
-    "Fixed Assets", "Investments", "Current Assets", "Stock-in-hand", "Deposits (Asset)",
-    "Loans & Advances (Asset)", "Bank Accounts", "Cash-in-hand", "Sundry Debtors",
-    "Misc. Expenses (ASSET)", "Suspense Account", "Branch / Divisions",
-}
-
-PL_PRIMARY_GROUPS = {
-    "Sales Accounts", "Purchase Accounts", "Direct Incomes", "Indirect Incomes",
-    "Direct Expenses", "Indirect Expenses",
-}
-
-PRIMARY_GROUPS = BS_PRIMARY_GROUPS | PL_PRIMARY_GROUPS
+ACCOUNTING_VOUCHER_TYPES = {"Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra"}
 
 # Helper functions
 def strip_ns(tag):
@@ -46,15 +30,8 @@ def clean_text(text):
     return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", str(text)).strip()
 
 def xml_cleanup(xml_text):
-    def fix_char_ref(match):
-        value = match.group(1)
-        try:
-            cp = int(value[1:], 16) if value.lower().startswith("x") else int(value)
-        except: return ""
-        if cp in (9, 10, 13) or (32 <= cp <= 55295) or (57344 <= cp <= 65533) or (65536 <= cp <= 1114111):
-            return match.group(0)
-        return ""
-    xml_text = re.sub(r"&#(x[0-9A-Fa-f]+|\d+);", fix_char_ref, xml_text)
+    if not xml_text: return ""
+    xml_text = re.sub(r"&#(x[0-9A-Fa-f]+|\d+);", lambda m: chr(int(m.group(1)[1:], 16)) if m.group(1).startswith('x') else chr(int(m.group(1))), xml_text, flags=re.IGNORECASE)
     xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", xml_text)
     xml_text = re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", xml_text)
     xml_text = re.sub(r"<(/?)[A-Za-z_][\w.-]*:([A-Za-z_][\w.-]*)", r"<\1\2", xml_text)
@@ -88,18 +65,7 @@ def format_tally_date(value):
 
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
-    xml = (
-        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
-        "<TYPE>COLLECTION</TYPE><ID>MyCompanyInfo</ID></HEADER><BODY><DESC>"
-        "<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>"
-        "<TDL><TDLMESSAGE>"
-        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE>"
-        "<FETCH>Name, StartingFrom, EndingAt</FETCH>"
-        "<FILTER>IsActiveCompany</FILTER>"
-        "</COLLECTION>"
-        "<SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM>"
-        "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    )
+    xml = "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyC</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"MyC\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH><FILTER>IsActiveCompany</FILTER></COLLECTION><SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     try:
         r = requests.post(url, data=xml.encode("utf-8"), timeout=10)
         root = ET.fromstring(xml_cleanup(r.text).encode("utf-8"))
@@ -111,9 +77,8 @@ def get_company_info(host, port):
 
 def fetch_metadata(url, company):
     sv = f"<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY></STATICVARIABLES>"
-    v_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>VTypes</ID></HEADER><BODY><DESC>{sv}<TDL><TDLMESSAGE><COLLECTION NAME=\"VTypes\"><TYPE>VoucherType</TYPE><FETCH>Name, Parent</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    g_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>Groups</ID></HEADER><BODY><DESC>{sv}<TDL><TDLMESSAGE><COLLECTION NAME=\"Groups\"><TYPE>Group</TYPE><FETCH>Name, Parent, Nature, _PrimaryGroup</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    
+    v_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>VT</ID></HEADER><BODY><DESC>{sv}<TDL><TDLMESSAGE><COLLECTION NAME=\"VT\"><TYPE>VoucherType</TYPE><FETCH>Name, Parent</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    g_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>GR</ID></HEADER><BODY><DESC>{sv}<TDL><TDLMESSAGE><COLLECTION NAME=\"GR\"><TYPE>Group</TYPE><FETCH>Name, Parent, Nature, _PrimaryGroup</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     vm, gm = {}, {}
     try:
         rv = requests.post(url, data=v_xml.encode("utf-8"), timeout=30)
@@ -126,11 +91,9 @@ def fetch_metadata(url, company):
             if strip_ns(g.tag).upper() == "GROUP":
                 n = direct_child_text(g, "NAME")
                 if n: gm[n] = {"Parent": direct_child_text(g, "PARENT"), "Nature": direct_child_text(g, "NATURE"), "PrimaryGroup": direct_child_text(g, "_PRIMARYGROUP")}
-        
-        base_types = {"Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra"}
         for _ in range(5):
             for n, p in vm.items():
-                if p and p not in base_types and p in vm: vm[n] = vm[p]
+                if p and p not in ACCOUNTING_VOUCHER_TYPES and p in vm: vm[n] = vm[p]
             for n, i in gm.items():
                 p = i["Parent"]
                 if p and not i["Nature"] and p in gm: i["Nature"] = gm[p]["Nature"]
@@ -138,157 +101,117 @@ def fetch_metadata(url, company):
     except: pass
     return vm, gm
 
-# Caching logic to prevent Power BI from hitting Tally multiple times simultaneously
-cache_file = os.path.join(tempfile.gettempdir(), f"tally_data_cache_{PORT}.pkl")
-cache_expiry = 60 # 60 seconds
+# Caching & Locking
+cache_file = os.path.join(tempfile.gettempdir(), f"tally_cache_{PORT}.pkl")
+lock_file = os.path.join(tempfile.gettempdir(), f"tally_lock_{PORT}.lock")
 
-def load_cached_data():
-    if os.path.exists(cache_file):
-        if (time.time() - os.path.getmtime(cache_file)) < cache_expiry:
-            try:
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except: return None
-    return None
+def get_data():
+    if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file)) < 300: # 5 min cache
+        try:
+            with open(cache_file, 'rb') as f: return pickle.load(f)
+        except: pass
+    
+    # Try to acquire lock
+    for _ in range(120): # Wait up to 2 minutes
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            if (time.time() - os.path.getmtime(lock_file)) > 180: # Break stale lock
+                try: os.remove(lock_file)
+                except: pass
+            time.sleep(1)
+            # Check if cache was created while waiting
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'rb') as f: return pickle.load(f)
+                except: pass
+    else: return None # Could not acquire lock
 
-def save_to_cache(data):
     try:
-        with open(cache_file, 'wb') as f:
-            pickle.dump(data, f)
-    except: pass
+        url = f"http://{HOST}:{PORT}"
+        c_name, s_dt, e_dt = get_company_info(HOST, PORT)
+        comp = COMPANY or c_name
+        f_dt = FROM_DATE or s_dt
+        t_dt = TO_DATE or e_dt
+        v_map, g_map = fetch_metadata(url, comp)
 
-cached_dfs = load_cached_data()
-
-if cached_dfs:
-    Journal = cached_dfs['Journal']
-    Ledger = cached_dfs['Ledger']
-    StockItem = cached_dfs['StockItem']
-    StockVoucher = cached_dfs['StockVoucher']
-else:
-    # Main extraction logic
-    url = f"http://{HOST}:{PORT}"
-    company_name, start_dt, end_dt = get_company_info(HOST, PORT)
-    COMPANY = COMPANY or company_name
-    FROM_DATE = FROM_DATE or start_dt
-    TO_DATE = TO_DATE or end_dt
-
-    vtype_map, group_map = fetch_metadata(url, COMPANY)
-
-    # 1. LEDGERS
-    time.sleep(1) # Breathe
-    l_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>L</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(COMPANY)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"L\"><TYPE>Ledger</TYPE><FETCH>Name, Parent, PartyGSTIN, MasterID, StartingFrom, OpeningBalance, ClosingBalance, IncomeTaxNumber</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    l_rows = []
-    try:
+        # 1. LEDGERS
+        l_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>L</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"L\"><TYPE>Ledger</TYPE><FETCH>Name, Parent, PartyGSTIN, MasterID, OpeningBalance, ClosingBalance, IncomeTaxNumber</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+        l_rows = []
         rl = requests.post(url, data=l_xml.encode("utf-8"), timeout=60)
         for elem in ET.fromstring(xml_cleanup(rl.text)).iter():
             if strip_ns(elem.tag).upper() != "LEDGER": continue
-            name = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
-            if not name: continue
-            parent = direct_child_text(elem, "PARENT")
-            pg = group_map.get(parent, {}).get("PrimaryGroup", "") or first_non_empty_text(elem, ["PRIMARYGROUP"])
-            nog = group_map.get(parent, {}).get("Nature", "")
-            nat = ""
-            if nog:
-                nv = nog.lower()
-                if nv in ["assets", "liabilities"]: nat = "BS"
-                elif nv in ["income", "expenses"]: nat = "PL"
-            l_rows.append({
-                "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"),
-                "Name": name, "PrimaryGroup": pg, "Nature": nat, "NatureOfGroup": nog,
-                "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]),
-                "Parent": parent, "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"]),
-                "OpeningBalance": float(to_decimal(direct_child_text(elem, "OPENINGBALANCE"))),
-                "ClosingBalance": float(to_decimal(direct_child_text(elem, "CLOSINGBALANCE"))),
-                "CompanyName": COMPANY, "FromDate": format_tally_date(FROM_DATE), "ToDate": format_tally_date(TO_DATE)
-            })
-    except: pass
-    Ledger = pd.DataFrame(l_rows)
-    ledger_meta = {r["Name"]: r for r in l_rows}
+            n = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
+            if not n: continue
+            p = direct_child_text(elem, "PARENT")
+            pg = g_map.get(p, {}).get("PrimaryGroup", "") or direct_child_text(elem, "PRIMARYGROUP")
+            nog = g_map.get(p, {}).get("Nature", "")
+            nat = "BS" if nog and nog.lower() in ["assets", "liabilities"] else ("PL" if nog and nog.lower() in ["income", "expenses"] else "")
+            l_rows.append({"MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Name": n, "PrimaryGroup": pg, "Nature": nat, "NatureOfGroup": nog, "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]), "Parent": p, "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"]), "OpeningBalance": float(to_decimal(direct_child_text(elem, "OPENINGBALANCE"))), "ClosingBalance": float(to_decimal(direct_child_text(elem, "CLOSINGBALANCE"))), "CompanyName": comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
+        l_df = pd.DataFrame(l_rows)
+        l_meta = {r["Name"]: r for r in l_rows}
 
-    # 2. JOURNALS (Vouchers)
-    time.sleep(2) # Give Tally more time
-    v_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>V</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(COMPANY)}</SVCURRENTCOMPANY><SVFROMDATE TYPE='Date'>{escape(FROM_DATE)}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(TO_DATE)}</SVTODATE></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"V\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, AllLedgerEntries.IsDeemedPositive</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    v_rows = []
-    try:
-        rv = requests.post(url, data=v_xml.encode("utf-8"), timeout=120)
-        for v in ET.fromstring(xml_cleanup(rv.text)).iter():
-            if strip_ns(v.tag).upper() != "VOUCHER": continue
-            vt = direct_child_text(v, "VOUCHERTYPENAME")
-            base_vt = vtype_map.get(vt, vt)
-            if base_vt not in ACCOUNTING_VOUCHER_TYPES: continue
+        # CHUNKING LOGIC FOR VOUCHERS
+        v_rows, sv_rows = [], []
+        d1 = datetime.strptime(f_dt, "%Y%m%d")
+        d2 = datetime.strptime(t_dt, "%Y%m%d")
+        curr = d1
+        while curr <= d2:
+            chunk_start = curr.strftime("%Y%m%d")
+            chunk_end = (curr + timedelta(days=31)).replace(day=1) - timedelta(days=1)
+            if chunk_end > d2: chunk_end = d2
+            chunk_end_str = chunk_end.strftime("%Y%m%d")
             
-            v_date, v_num = format_tally_date(direct_child_text(v, "DATE")), direct_child_text(v, "VOUCHERNUMBER")
-            v_nar = first_non_empty_text(v, ["NARRATION", "VOUCHERNARRATION"])
+            sv_chunk = f"<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(comp)}</SVCURRENTCOMPANY><SVFROMDATE TYPE='Date'>{chunk_start}</SVFROMDATE><SVTODATE TYPE='Date'>{chunk_end_str}</SVTODATE></STATICVARIABLES>"
             
-            entries = [c for c in list(v) if "LEDGERENTRIES.LIST" in strip_ns(c.tag).upper()]
-            for ent in entries:
-                ln = direct_child_text(ent, "LEDGERNAME")
-                amt = to_decimal(direct_child_text(ent, "AMOUNT"))
-                if not ln or amt == 0: continue
-                is_pos = direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES"
-                signed = abs(amt) * (Decimal("-1") if is_pos else Decimal("1"))
-                meta = ledger_meta.get(ln, {})
-                v_rows.append({
-                    "Date": v_date, "VoucherTypeName": vt, "BaseVoucherType": base_vt, "VoucherNumber": v_num,
-                    "LedgerName": ln, "MasterID": meta.get("MasterID", ""), "Amount": float(signed),
-                    "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0,
-                    "CreditAmount": float(abs(signed)) if signed > 0 else 0.0,
-                    "ParentLedger": meta.get("Parent", ""), "PrimaryGroup": meta.get("PrimaryGroup", ""),
-                    "Nature": meta.get("Nature", ""), "NatureOfGroup": meta.get("NatureOfGroup", ""),
-                    "PAN": meta.get("PAN", ""), "PartyLedgerName": direct_child_text(v, "PARTYLEDGERNAME"),
-                    "PartyGSTIN": direct_child_text(v, "PARTYGSTIN"), "LedgerGSTIN": meta.get("PartyGSTIN", ""),
-                    "VoucherNarration": v_nar, "CompanyName": COMPANY, "FromDate": format_tally_date(FROM_DATE), "ToDate": format_tally_date(TO_DATE)
-                })
-    except: pass
-    Journal = pd.DataFrame(v_rows)
+            # JOURNALS
+            v_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>V</ID></HEADER><BODY><DESC>{sv_chunk}<TDL><TDLMESSAGE><COLLECTION NAME=\"V\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, AllLedgerEntries.IsDeemedPositive</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+            rv = requests.post(url, data=v_xml.encode("utf-8"), timeout=120)
+            for v in ET.fromstring(xml_cleanup(rv.text)).iter():
+                if strip_ns(v.tag).upper() != "VOUCHER": continue
+                vtype = direct_child_text(v, "VOUCHERTYPENAME")
+                if v_map.get(vtype, vtype) not in ACCOUNTING_VOUCHER_TYPES: continue
+                vd, vn, v_nar = format_tally_date(direct_child_text(v, "DATE")), direct_child_text(v, "VOUCHERNUMBER"), first_non_empty_text(v, ["NARRATION", "VOUCHERNARRATION"])
+                for ent in [c for c in list(v) if "LEDGERENTRIES.LIST" in strip_ns(c.tag).upper()]:
+                    ln = direct_child_text(ent, "LEDGERNAME")
+                    amt = to_decimal(direct_child_text(ent, "AMOUNT"))
+                    if not ln or amt == 0: continue
+                    signed = abs(amt) * (Decimal("-1") if direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES" else Decimal("1"))
+                    m = l_meta.get(ln, {})
+                    v_rows.append({"Date": vd, "VoucherTypeName": vtype, "BaseVoucherType": v_map.get(vtype, vtype), "VoucherNumber": vn, "LedgerName": ln, "MasterID": m.get("MasterID", ""), "Amount": float(signed), "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0, "CreditAmount": float(abs(signed)) if signed > 0 else 0.0, "ParentLedger": m.get("Parent", ""), "PrimaryGroup": m.get("PrimaryGroup", ""), "Nature": m.get("Nature", ""), "NatureOfGroup": m.get("NatureOfGroup", ""), "PAN": m.get("PAN", ""), "PartyLedgerName": direct_child_text(v, "PARTYLEDGERNAME"), "PartyGSTIN": direct_child_text(v, "PARTYGSTIN"), "LedgerGSTIN": m.get("PartyGSTIN", ""), "VoucherNarration": v_nar, "CompanyName": comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
+            
+            # STOCK VOUCHERS
+            sv_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>SV</ID></HEADER><BODY><DESC>{sv_chunk}<TDL><TDLMESSAGE><COLLECTION NAME=\"SV\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, InventoryEntries.StockItemName, InventoryEntries.Amount, InventoryEntries.BilledQty, InventoryEntries.Rate, InventoryEntries.IsDeemedPositive</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+            rsv = requests.post(url, data=sv_xml.encode("utf-8"), timeout=120)
+            for v in ET.fromstring(xml_cleanup(rsv.text)).iter():
+                if strip_ns(v.tag).upper() != "VOUCHER" or "Order" in direct_child_text(v, "VOUCHERTYPENAME"): continue
+                vd, vn, v_nar = format_tally_date(direct_child_text(v, "DATE")), direct_child_text(v, "VOUCHERNUMBER"), first_non_empty_text(v, ["NARRATION", "VOUCHERNARRATION"])
+                for ent in [c for c in list(v) if "INVENTORYENTRIES" in strip_ns(c.tag).upper()]:
+                    inm = direct_child_text(ent, "STOCKITEMNAME")
+                    if not inm: continue
+                    is_in = direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES"
+                    q, a = abs(float(to_decimal(direct_child_text(ent, "BILLEDQTY")))), abs(float(to_decimal(direct_child_text(ent, "AMOUNT"))))
+                    sv_rows.append({"Date": vd, "VoucherTypeName": direct_child_text(v, "VOUCHERTYPENAME"), "VoucherNumber": vn, "StockItemName": inm, "BilledQty": q if is_in else -q, "Rate": float(to_decimal(direct_child_text(ent, "RATE"))), "Amount": a if is_in else -a, "VoucherNarration": v_nar, "CompanyName": comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
+            
+            curr = chunk_end + timedelta(days=1)
+            time.sleep(1) # Small gap between chunks
 
-    # 3. STOCK ITEMS
-    time.sleep(1)
-    si_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>SI</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(COMPANY)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"SI\"><TYPE>StockItem</TYPE><FETCH>Name, Parent, Category, LedgerName, OpeningBalance, OpeningValue, BasicValue, BasicQty, OpeningRate</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    si_rows = []
-    try:
+        # 4. STOCK ITEMS
+        si_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>SI</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"SI\"><TYPE>StockItem</TYPE><FETCH>Name, Parent, Category, LedgerName, OpeningBalance, OpeningValue, BasicValue, BasicQty, OpeningRate</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+        si_rows = []
         rsi = requests.post(url, data=si_xml.encode("utf-8"), timeout=60)
         for elem in ET.fromstring(xml_cleanup(rsi.text)).iter():
             if strip_ns(elem.tag).upper() != "STOCKITEM": continue
-            si_rows.append({
-                "Name": clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME"),
-                "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"),
-                "LedgerName": direct_child_text(elem, "LEDGERNAME"),
-                "OpeningBalance": float(to_decimal(direct_child_text(elem, "OPENINGBALANCE"))),
-                "OpeningValue": float(to_decimal(direct_child_text(elem, "OPENINGVALUE"))),
-                "BasicValue": float(to_decimal(direct_child_text(elem, "BASICVALUE"))),
-                "BasicQty": float(to_decimal(direct_child_text(elem, "BASICQTY"))),
-                "OpeningRate": float(to_decimal(direct_child_text(elem, "OPENINGRATE"))),
-                "CompanyName": COMPANY, "FromDate": format_tally_date(FROM_DATE), "ToDate": format_tally_date(TO_DATE)
-            })
-    except: pass
-    StockItem = pd.DataFrame(si_rows)
+            si_rows.append({"Name": clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME"), "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": float(to_decimal(direct_child_text(elem, "OPENINGBALANCE"))), "OpeningValue": float(to_decimal(direct_child_text(elem, "OPENINGVALUE"))), "BasicValue": float(to_decimal(direct_child_text(elem, "BASICVALUE"))), "BasicQty": float(to_decimal(direct_child_text(elem, "BASICQTY"))), "OpeningRate": float(to_decimal(direct_child_text(elem, "OPENINGRATE"))), "CompanyName": comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
+        
+        final_data = {'Journal': pd.DataFrame(v_rows), 'Ledger': l_df, 'StockItem': pd.DataFrame(si_rows), 'StockVoucher': pd.DataFrame(sv_rows)}
+        with open(cache_file, 'wb') as f: pickle.dump(final_data, f)
+        return final_data
+    finally:
+        try: os.remove(lock_file)
+        except: pass
 
-    # 4. STOCK VOUCHERS
-    time.sleep(2)
-    sv_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>SV</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(COMPANY)}</SVCURRENTCOMPANY><SVFROMDATE TYPE='Date'>{escape(FROM_DATE)}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(TO_DATE)}</SVTODATE></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"SV\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, InventoryEntries.StockItemName, InventoryEntries.Amount, InventoryEntries.BilledQty, InventoryEntries.Rate, InventoryEntries.IsDeemedPositive, InventoryEntries.BatchAllocations.List</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    sv_rows = []
-    try:
-        rsv = requests.post(url, data=sv_xml.encode("utf-8"), timeout=120)
-        for v in ET.fromstring(xml_cleanup(rsv.text)).iter():
-            if strip_ns(v.tag).upper() != "VOUCHER": continue
-            vt = direct_child_text(v, "VOUCHERTYPENAME")
-            if "Order" in vt: continue
-            vd, vn, v_nar = format_tally_date(direct_child_text(v, "DATE")), direct_child_text(v, "VOUCHERNUMBER"), first_non_empty_text(v, ["NARRATION", "VOUCHERNARRATION"])
-            inv_nodes = [c for c in list(v) if "INVENTORYENTRIES" in strip_ns(c.tag).upper()]
-            for ent in inv_nodes:
-                inm = direct_child_text(ent, "STOCKITEMNAME")
-                if not inm: continue
-                is_inward = direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES"
-                qty, amt = abs(float(to_decimal(direct_child_text(ent, "BILLEDQTY")))), abs(float(to_decimal(direct_child_text(ent, "AMOUNT"))))
-                sv_rows.append({
-                    "Date": vd, "VoucherTypeName": vt, "VoucherNumber": vn, "StockItemName": inm,
-                    "BilledQty": qty if is_inward else -qty, "Rate": float(to_decimal(direct_child_text(ent, "RATE"))),
-                    "Amount": amt if is_inward else -amt, "VoucherNarration": v_nar,
-                    "CompanyName": COMPANY, "FromDate": format_tally_date(FROM_DATE), "ToDate": format_tally_date(TO_DATE)
-                })
-    except: pass
-    StockVoucher = pd.DataFrame(sv_rows)
-
-    # Save to cache for subsequent Power BI processes
-    save_to_cache({'Journal': Journal, 'Ledger': Ledger, 'StockItem': StockItem, 'StockVoucher': StockVoucher})
+data = get_data()
+Journal, Ledger, StockItem, StockVoucher = data['Journal'], data['Ledger'], data['StockItem'], data['StockVoucher']
