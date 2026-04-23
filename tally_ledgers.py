@@ -201,9 +201,9 @@ _, group_map = fetch_tally_metadata(url, sel_comp)
 root = ET.fromstring(xml_cleanup(post_to_tally(url, build_ledger_request_xml(sel_comp))))
 rows = parse_ledgers(root, group_map)
 
-dataset = pd.DataFrame(rows, columns=LEDGER_COLUMNS)
-for row in dataset.to_dict('records'): # Just to ensure we have the FY info
-    dataset['CompanyName'] = sel_comp
-    dataset['FromDate'] = format_tally_date(det_start)
-    dataset['ToDate'] = format_tally_date(det_end)
-dataset = dataset[LEDGER_COLUMNS]
+Ledger = pd.DataFrame(rows, columns=LEDGER_COLUMNS)
+for row in Ledger.to_dict('records'): # Just to ensure we have the FY info
+    Ledger['CompanyName'] = sel_comp
+    Ledger['FromDate'] = format_tally_date(det_start)
+    Ledger['ToDate'] = format_tally_date(det_end)
+Ledger = Ledger[LEDGER_COLUMNS]

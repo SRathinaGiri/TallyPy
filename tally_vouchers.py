@@ -158,5 +158,5 @@ for v in root.iter():
         meta = l_meta.get(ln, {})
         rows.append({"Date": vd, "VoucherTypeName": vtype, "BaseVoucherType": base_vt, "VoucherNumber": vn, "LedgerName": ln, "MasterID": meta.get("MasterID", ""), "Amount": float(signed), "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0, "CreditAmount": float(abs(signed)) if signed > 0 else 0.0, "ParentLedger": meta.get("Parent", ""), "PrimaryGroup": meta.get("PrimaryGroup", ""), "Nature": meta.get("Nature", ""), "NatureOfGroup": meta.get("NatureOfGroup", ""), "PAN": meta.get("PAN", ""), "PartyLedgerName": direct_child_text(v, "PARTYLEDGERNAME"), "PartyGSTIN": direct_child_text(v, "PARTYGSTIN"), "LedgerGSTIN": meta.get("PartyGSTIN", ""), "VoucherNarration": v_nar, "IsOptional": direct_child_text(v, "ISOPTIONAL"), "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
 
-dataset = pd.DataFrame(rows, columns=VOUCHER_COLUMNS)
-dataset = dataset[VOUCHER_COLUMNS]
+Journal = pd.DataFrame(rows, columns=VOUCHER_COLUMNS)
+Journal = Journal[VOUCHER_COLUMNS]

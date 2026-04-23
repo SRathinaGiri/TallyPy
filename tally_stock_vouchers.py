@@ -99,5 +99,5 @@ for v in root.iter():
         gn, bn = (direct_child_text(batch_nodes[0], "GODOWNNAME"), direct_child_text(batch_nodes[0], "BATCHNAME")) if batch_nodes else ("", "")
         sv_rows.append({"Date": vd, "VoucherTypeName": direct_child_text(v, "VOUCHERTYPENAME"), "VoucherNumber": vn, "StockItemName": inm, "BilledQty": q if is_in else -q, "Rate": float(to_decimal(direct_child_text(ent, "RATE"))), "Amount": a if is_in else -a, "GodownName": gn, "BatchName": bn, "VoucherNarration": v_nar, "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
 
-dataset = pd.DataFrame(sv_rows, columns=STOCK_VOUCHER_COLUMNS)
-dataset = dataset[STOCK_VOUCHER_COLUMNS]
+StockVoucher = pd.DataFrame(sv_rows, columns=STOCK_VOUCHER_COLUMNS)
+StockVoucher = StockVoucher[STOCK_VOUCHER_COLUMNS]

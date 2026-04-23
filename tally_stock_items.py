@@ -84,5 +84,5 @@ for elem in root.iter():
     if strip_ns(elem.tag).upper() == "STOCKITEM":
         si_rows.append({"Name": clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME"), "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": float(to_decimal(direct_child_text(elem, "OPENINGBALANCE"))), "OpeningValue": float(to_decimal(direct_child_text(elem, "OPENINGVALUE"))), "BasicValue": float(to_decimal(direct_child_text(elem, "BASICVALUE"))), "BasicQty": float(to_decimal(direct_child_text(elem, "BASICQTY"))), "OpeningRate": float(to_decimal(direct_child_text(elem, "OPENINGRATE"))), "ClosingBalance": float(to_decimal(direct_child_text(elem, "CLOSINGBALANCE"))), "ClosingValue": float(to_decimal(direct_child_text(elem, "CLOSINGVALUE"))), "ClosingRate": float(to_decimal(direct_child_text(elem, "CLOSINGRATE"))), "CompanyName": sel_comp, "FromDate": format_tally_date(det_start), "ToDate": format_tally_date(det_end)})
 
-dataset = pd.DataFrame(si_rows, columns=STOCK_ITEM_COLUMNS)
-dataset = dataset[STOCK_ITEM_COLUMNS]
+StockItem = pd.DataFrame(si_rows, columns=STOCK_ITEM_COLUMNS)
+StockItem = StockItem[STOCK_ITEM_COLUMNS]
