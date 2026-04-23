@@ -218,7 +218,12 @@ def get_data():
             if strip_ns(elem.tag).upper() != "STOCKITEM": continue
             si_rows.append({"Name": clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME"), "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": float(to_decimal(direct_child_text(elem, "OPENINGBALANCE"))), "OpeningValue": float(to_decimal(direct_child_text(elem, "OPENINGVALUE"))), "BasicValue": float(to_decimal(direct_child_text(elem, "BASICVALUE"))), "BasicQty": float(to_decimal(direct_child_text(elem, "BASICQTY"))), "OpeningRate": float(to_decimal(direct_child_text(elem, "OPENINGRATE"))), "ClosingBalance": float(to_decimal(direct_child_text(elem, "CLOSINGBALANCE"))), "ClosingValue": float(to_decimal(direct_child_text(elem, "CLOSINGVALUE"))), "ClosingRate": float(to_decimal(direct_child_text(elem, "CLOSINGRATE"))), "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
         
-        final_dfs = {'Journal': pd.DataFrame(v_rows), 'Ledger': l_df, 'StockItem': pd.DataFrame(si_rows), 'StockVoucher': pd.DataFrame(sv_rows)}
+        final_dfs = {
+            'Journal': pd.DataFrame(v_rows, columns=VOUCHER_COLUMNS),
+            'Ledger': pd.DataFrame(l_rows, columns=LEDGER_COLUMNS),
+            'StockItem': pd.DataFrame(si_rows, columns=STOCK_ITEM_COLUMNS),
+            'StockVoucher': pd.DataFrame(sv_rows, columns=STOCK_VOUCHER_COLUMNS)
+        }
         for n, df in final_dfs.items():
             cols = {"Journal": VOUCHER_COLUMNS, "Ledger": LEDGER_COLUMNS, "StockItem": STOCK_ITEM_COLUMNS, "StockVoucher": STOCK_VOUCHER_COLUMNS}[n]
             for c in cols:
