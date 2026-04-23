@@ -155,7 +155,7 @@ def get_data():
         if not re.fullmatch(r"\d{8}", f_dt): f_dt = def_start
         if not re.fullmatch(r"\d{8}", t_dt): t_dt = def_end
 
-        v_map, g_map = fetch_metadata(url, sel_comp)
+        vtype_map, group_map = fetch_metadata(url, sel_comp)
 
         # 1. LEDGERS
         l_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>L</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"L\"><TYPE>Ledger</TYPE><FETCH>Name, Parent, PartyGSTIN, MasterID, StartingFrom, CurrencyName, StateName, OpeningBalance, ClosingBalance, IncomeTaxNumber</FETCH><COMPUTE>PrimaryGroup:$_PrimaryGroup</COMPUTE><COMPUTE>CurrencyFormalName:$FormalName:Currency:$CurrencyName</COMPUTE><COMPUTE>CurrencySymbol:$UnicodeSymbol:Currency:$CurrencyName</COMPUTE><COMPUTE>CurrencyOriginalSymbol:$OriginalSymbol:Currency:$CurrencyName</COMPUTE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
@@ -186,14 +186,14 @@ def get_data():
             for v in ET.fromstring(xml_cleanup(rv.text)).iter():
                 if strip_ns(v.tag).upper() != "VOUCHER": continue
                 vtype = direct_child_text(v, "VOUCHERTYPENAME")
-                if v_map.get(vtype, vtype) not in ACCOUNTING_VOUCHER_TYPES: continue
+                if vtype_map.get(vtype, vtype) not in ACCOUNTING_VOUCHER_TYPES: continue
                 vd, vn, v_nar = format_tally_date(direct_child_text(v, "DATE")), direct_child_text(v, "VOUCHERNUMBER"), first_non_empty_text(v, ["NARRATION", "VOUCHERNARRATION"])
                 for ent in [c for c in list(v) if "LEDGERENTRIES.LIST" in strip_ns(c.tag).upper()]:
                     ln = direct_child_text(ent, "LEDGERNAME"); amt = to_decimal(direct_child_text(ent, "AMOUNT"))
                     if not ln or amt == 0: continue
                     signed = abs(amt) * (Decimal("-1") if direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES" else Decimal("1"))
                     m = l_meta.get(ln, {})
-                    v_rows.append({"Date": vd, "VoucherTypeName": vtype, "BaseVoucherType": v_map.get(vtype, vtype), "VoucherNumber": vn, "LedgerName": ln, "MasterID": m.get("MasterID", ""), "Amount": float(signed), "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0, "CreditAmount": float(abs(signed)) if signed > 0 else 0.0, "ParentLedger": m.get("Parent", ""), "PrimaryGroup": m.get("PrimaryGroup", ""), "Nature": m.get("Nature", ""), "NatureOfGroup": m.get("NatureOfGroup", ""), "PAN": m.get("PAN", ""), "PartyLedgerName": direct_child_text(v, "PARTYLEDGERNAME"), "PartyGSTIN": direct_child_text(v, "PARTYGSTIN"), "LedgerGSTIN": m.get("PartyGSTIN", ""), "VoucherNarration": v_nar, "IsOptional": direct_child_text(v, "ISOPTIONAL"), "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
+                    v_rows.append({"Date": vd, "VoucherTypeName": vtype, "BaseVoucherType": vtype_map.get(vtype, vtype), "VoucherNumber": vn, "LedgerName": ln, "MasterID": m.get("MasterID", ""), "Amount": float(signed), "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0, "CreditAmount": float(abs(signed)) if signed > 0 else 0.0, "ParentLedger": m.get("Parent", ""), "PrimaryGroup": m.get("PrimaryGroup", ""), "Nature": m.get("Nature", ""), "NatureOfGroup": m.get("NatureOfGroup", ""), "PAN": m.get("PAN", ""), "PartyLedgerName": direct_child_text(v, "PARTYLEDGERNAME"), "PartyGSTIN": direct_child_text(v, "PARTYGSTIN"), "LedgerGSTIN": m.get("PartyGSTIN", ""), "VoucherNarration": v_nar, "IsOptional": direct_child_text(v, "ISOPTIONAL"), "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
             
             # STOCK VOUCHERS
             rsv = requests.post(url, data=f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>SV</ID></HEADER><BODY><DESC>{chunk_sv}<TDL><TDLMESSAGE><COLLECTION NAME=\"SV\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, InventoryEntries.*, AllInventoryEntries.*</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>".encode("utf-8"), timeout=120)
