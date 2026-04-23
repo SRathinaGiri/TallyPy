@@ -15,7 +15,6 @@ TO_DATE = ""      # YYYYMMDD
 ACCOUNTING_VOUCHER_TYPES = {"Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra"}
 VOUCHER_COLUMNS = ["Date", "VoucherTypeName", "BaseVoucherType", "VoucherNumber", "LedgerName", "MasterID", "Amount", "DrCr", "DebitAmount", "CreditAmount", "ParentLedger", "PrimaryGroup", "Nature", "NatureOfGroup", "PAN", "PartyLedgerName", "PartyGSTIN", "LedgerGSTIN", "VoucherNarration", "IsOptional", "CompanyName", "FromDate", "ToDate"]
 
-# Core Helpers (Line-for-line with app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -67,7 +66,7 @@ def format_tally_date(value):
     return value
 
 def post_to_tally(url, xml_text):
-    return requests.post(url, data=xml_text.encode("utf-8"), timeout=120).text
+    return requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120).text
 
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
@@ -79,7 +78,7 @@ def get_company_info(host, port):
     except: pass
     return "", "", ""
 
-def fetch_metadata(url, company):
+def fetch_meta(url, company):
     sv = f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>" if company else ""
     v_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>VT</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{sv}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"VT\"><TYPE>VoucherType</TYPE><FETCH>Name, Parent</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     g_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>GR</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{sv}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"GR\"><TYPE>Group</TYPE><FETCH>Name, Parent, Nature, _PrimaryGroup</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
@@ -111,7 +110,7 @@ url = f"http://{HOST}:{PORT}"
 det_name, det_start, det_end = get_company_info(HOST, PORT)
 sel_comp = COMPANY or det_name
 f_dt, t_dt = FROM_DATE or det_start, TO_DATE or det_end
-v_map, g_map = fetch_metadata(url, sel_comp)
+v_map, g_map = fetch_meta(url, sel_comp)
 
 # Ledger meta
 l_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>LM</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"LM\"><TYPE>Ledger</TYPE><FETCH>Name, Parent, MasterID, PartyGSTIN, PAN</FETCH><COMPUTE>PrimaryGroup:$_PrimaryGroup</COMPUTE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
@@ -123,14 +122,16 @@ try:
             n = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
             if not n: continue
             p = direct_child_text(elem, "PARENT"); gi = g_map.get(p, {})
-            l_meta[n] = {"Name": n, "Parent": p, "PrimaryGroup": gi.get("PrimaryGroup") or direct_child_text(elem, "PRIMARYGROUP"), "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Nature": gi.get("Nature", ""), "NatureOfGroup": gi.get("Nature", ""), "PAN": first_non_empty_text(elem, ["PAN"]), "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"])}
+            pg = gi.get("PrimaryGroup") or direct_child_text(elem, "PRIMARYGROUP")
+            nog = gi.get("Nature", ""); nat = "BS" if nog and nog.lower() in ["assets", "liabilities"] else ("PL" if nog and nog.lower() in ["income", "expenses"] else "")
+            l_meta[n] = {"Name": n, "Parent": p, "PrimaryGroup": pg, "MasterID": elem.get("MASTERID") or direct_child_text(elem, "MASTERID"), "Nature": nat, "NatureOfGroup": nog, "PAN": first_non_empty_text(elem, ["PAN"]), "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"])}
 except: pass
 
 v_xml = (
     f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>V</ID></HEADER><BODY><DESC>"
     f"<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY>"
     f"<SVFROMDATE TYPE='Date'>{escape(f_dt)}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(t_dt)}</SVTODATE></STATICVARIABLES>"
-    "<TDL><TDLMESSAGE><COLLECTION NAME=\"V\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.*</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    "<TDL><TDLMESSAGE><COLLECTION NAME=\"V\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, AllLedgerEntries.IsDeemedPositive</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
 )
 
 root = ET.fromstring(xml_cleanup(post_to_tally(url, v_xml)))
@@ -141,7 +142,6 @@ for voucher in root.iter():
     if base_vt not in ACCOUNTING_VOUCHER_TYPES: continue
     vd, vn, v_nar = format_tally_date(direct_child_text(voucher, "DATE")), direct_child_text(voucher, "VOUCHERNUMBER"), first_non_empty_text(voucher, ["NARRATION", "VOUCHERNARRATION"])
     is_opt = "Yes" if direct_child_text(voucher, "ISOPTIONAL").upper() == "YES" else "No"
-    
     entries = direct_children(voucher, "ALLLEDGERENTRIES.LIST") or direct_children(voucher, "LEDGERENTRIES.LIST")
     for ent in entries:
         ln = direct_child_text(ent, "LEDGERNAME"); amt_v = to_decimal(direct_child_text(ent, "AMOUNT"))
