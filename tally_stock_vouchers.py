@@ -18,7 +18,7 @@ TO_DATE = ""      # YYYYMMDD
 
 STOCK_VOUCHER_COLUMNS = ["Date", "VoucherTypeName", "VoucherNumber", "StockItemName", "BilledQty", "Rate", "Amount", "GodownName", "BatchName", "VoucherNarration", "CompanyName", "FromDate", "ToDate"]
 
-# Core Helpers (Line-for-line with app1.py)
+# Core Helper Functions (Line-for-line with app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -67,8 +67,8 @@ def format_tally_date(value):
     if re.fullmatch(r"\d{8}", value): return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
     return value
 
-def post_to_tally(url, xml_text, timeout=120):
-    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=timeout)
+def post_to_tally(url, xml_text):
+    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120)
     r.raise_for_status()
     return r.content.decode(r.encoding or "utf-8", errors="replace")
 
@@ -95,9 +95,7 @@ else:
         try:
             fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd); break
         except:
-            if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: 
-                try: os.remove(lock_file)
-                except: pass
+            if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: os.remove(lock_file)
             time.sleep(1)
             if os.path.exists(ready_file) and (time.time() - os.path.getmtime(ready_file)) < 300:
                 StockVoucher = pd.read_csv(csv_file); break
@@ -108,8 +106,9 @@ else:
             det_name, det_start, det_end = get_company_info(HOST, PORT)
             sel_comp = COMPANY or det_name
             f_dt, t_dt = FROM_DATE or det_start, TO_DATE or det_end
-            sv_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>SV</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY><SVFROMDATE TYPE='Date'>{escape(f_dt)}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(t_dt)}</SVTODATE></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"SV\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-            root = ET.fromstring(xml_cleanup(post_to_tally(url, sv_xml)))
+            
+            sv_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>SV</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY><SVFROMDATE TYPE='Date'>{escape(f_dt)}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(t_dt)}</SVTODATE></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"SV\"><TYPE>Voucher</TYPE><FETCH>Date, VoucherTypeName, VoucherNumber, Narration, InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+            root = ET.fromstring(xml_cleanup(post_to_tally(url, sv_req)))
             sv_rows = []
             for v in root.findall(".//VOUCHER"):
                 vtype = direct_child_text(v, "VOUCHERTYPENAME")
@@ -121,8 +120,11 @@ else:
                     if not inm: continue
                     is_in = direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES"
                     q, a = abs(to_float(direct_child_text(ent, "BILLEDQTY"))), abs(to_float(direct_child_text(ent, "AMOUNT")))
-                    batch_nodes = [bc for bc in list(ent) if "BATCHALLOCATIONS.LIST" in strip_ns(bc.tag).upper()]
+                    
+                    # Batch info using direct list children matching app1.py
+                    batch_nodes = [c for c in list(ent) if "BATCHALLOCATIONS.LIST" in strip_ns(c.tag).upper()]
                     gn, bn = (direct_child_text(batch_nodes[0], "GODOWNNAME"), direct_child_text(batch_nodes[0], "BATCHNAME")) if batch_nodes else ("", "")
+                    
                     sv_rows.append({"Date": vd, "VoucherTypeName": vtype, "VoucherNumber": vn, "StockItemName": inm, "BilledQty": q if is_in else -q, "Rate": to_float(direct_child_text(ent, "RATE")), "Amount": a if is_in else -a, "GodownName": gn, "BatchName": bn, "VoucherNarration": v_nar, "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
             StockVoucher = pd.DataFrame(sv_rows, columns=STOCK_VOUCHER_COLUMNS)
             StockVoucher.to_csv(csv_file, index=False)

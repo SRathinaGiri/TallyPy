@@ -15,7 +15,7 @@ COMPANY = ""      # Leave blank to auto-detect
 
 STOCK_ITEM_COLUMNS = ["Name", "Parent", "Category", "LedgerName", "OpeningBalance", "OpeningValue", "BasicValue", "BasicQty", "OpeningRate", "ClosingBalance", "ClosingValue", "ClosingRate", "CompanyName", "FromDate", "ToDate"]
 
-# Core Helpers (Line-for-line with app1.py)
+# Core Helper Functions (Line-for-line with app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -58,8 +58,8 @@ def format_tally_date(value):
     if re.fullmatch(r"\d{8}", value): return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
     return value
 
-def post_to_tally(url, xml_text, timeout=120):
-    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=timeout)
+def post_to_tally(url, xml_text):
+    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120)
     r.raise_for_status()
     return r.content.decode(r.encoding or "utf-8", errors="replace")
 
@@ -86,9 +86,7 @@ else:
         try:
             fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd); break
         except:
-            if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: 
-                try: os.remove(lock_file)
-                except: pass
+            if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: os.remove(lock_file)
             time.sleep(1)
             if os.path.exists(ready_file) and (time.time() - os.path.getmtime(ready_file)) < 300:
                 StockItem = pd.read_csv(csv_file); break
@@ -102,9 +100,9 @@ else:
             root = ET.fromstring(xml_cleanup(post_to_tally(url, si_req)))
             si_rows = []
             for elem in root.findall(".//STOCKITEM"):
-                name = clean_text(elem.get("NAME")) or elem.findtext("NAME", "")
-                if not name: continue
-                si_rows.append({"Name": name, "Parent": elem.findtext("PARENT", ""), "Category": elem.findtext("CATEGORY", ""), "LedgerName": elem.findtext("LEDGERNAME", ""), "OpeningBalance": to_float(elem.findtext("OPENINGBALANCE", "0")), "OpeningValue": to_float(elem.findtext("OPENINGVALUE", "0")), "BasicValue": to_float(elem.findtext("BASICVALUE", "0")), "BasicQty": to_float(elem.findtext("BASICQTY", "0")), "OpeningRate": to_float(elem.findtext("OPENINGRATE", "0")), "ClosingBalance": to_float(elem.findtext("CLOSINGBALANCE", "0")), "ClosingValue": to_float(elem.findtext("CLOSINGVALUE", "0")), "ClosingRate": to_float(elem.findtext("CLOSINGRATE", "0")), "CompanyName": sel_comp, "FromDate": format_tally_date(det_start), "ToDate": format_tally_date(det_end)})
+                n = clean_text(elem.get("NAME")) or elem.findtext("NAME", "")
+                if not n: continue
+                si_rows.append({"Name": n, "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": to_float(elem.findtext("OPENINGBALANCE", "0")), "OpeningValue": to_float(elem.findtext("OPENINGVALUE", "0")), "BasicValue": to_float(elem.findtext("BASICVALUE", "0")), "BasicQty": to_float(elem.findtext("BASICQTY", "0")), "OpeningRate": to_float(elem.findtext("OPENINGRATE", "0")), "ClosingBalance": to_float(elem.findtext("CLOSINGBALANCE", "0")), "ClosingValue": to_float(elem.findtext("CLOSINGVALUE", "0")), "ClosingRate": to_float(elem.findtext("CLOSINGRATE", "0")), "CompanyName": sel_comp, "FromDate": format_tally_date(det_start), "ToDate": format_tally_date(det_end)})
             StockItem = pd.DataFrame(si_rows, columns=STOCK_ITEM_COLUMNS)
             StockItem.to_csv(csv_file, index=False)
             with open(ready_file, 'w') as f: f.write("done")

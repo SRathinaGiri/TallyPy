@@ -7,22 +7,17 @@ import time
 import tempfile
 from decimal import Decimal, InvalidOperation
 from xml.sax.saxutils import escape
-from datetime import datetime
 
 # Power BI / Tally configuration
 HOST = "localhost"
 PORT = "9000"
 COMPANY = ""      # Leave blank to auto-detect
 
-# Mapping constants from app1.py
-BS_PRIMARY_GROUPS = {"Capital Account", "Reserves & Surplus", "Loans (Liability)", "Bank OD A/c", "Secured Loans", "Unsecured Loans", "Current Liabilities", "Duties & Taxes", "Provisions", "Sundry Creditors", "Fixed Assets", "Investments", "Current Assets", "Stock-in-hand", "Deposits (Asset)", "Loans & Advances (Asset)", "Bank Accounts", "Cash-in-hand", "Sundry Debtors", "Misc. Expenses (ASSET)", "Suspense Account", "Branch / Divisions"}
-PL_PRIMARY_GROUPS = {"Sales Accounts", "Purchase Accounts", "Direct Incomes", "Indirect Incomes", "Direct Expenses", "Indirect Expenses"}
-PRIMARY_GROUPS = BS_PRIMARY_GROUPS | PL_PRIMARY_GROUPS
-CURRENCY_SYMBOL_FALLBACKS = {"INR": "₹", "INDIAN RUPEE": "₹", "RUPEE": "₹", "RUPEES": "₹", "RS": "₹", "RS.": "₹", "USD": "$", "US DOLLAR": "$", "DOLLAR": "$", "EUR": "€", "EURO": "€", "GBP": "£", "POUND": "£", "POUND STERLING": "£", "AED": "د.இ", "DIRHAM": "د.இ", "": ""}
-
 LEDGER_COLUMNS = ["MasterID", "Name", "PrimaryGroup", "Nature", "NatureOfGroup", "PAN", "StartingFrom", "CurrencyName", "StateName", "Parent", "PartyGSTIN", "OpeningBalance", "ClosingBalance", "CompanyName", "FromDate", "ToDate"]
+CURRENCY_SYMBOL_FALLBACKS = {"INR": "₹", "INDIAN RUPEE": "₹", "RUPEE": "₹", "RUPEES": "₹", "RS": "₹", "RS.": "₹", "USD": "$", "US DOLLAR": "$", "DOLLAR": "$", "EUR": "€", "EURO": "€", "GBP": "£", "POUND": "£", "POUND STERLING": "£", "AED": "د.இ", "DIRHAM": "د.இ", "": ""}
+PRIMARY_GROUPS = {"Capital Account", "Reserves & Surplus", "Loans (Liability)", "Bank OD A/c", "Secured Loans", "Unsecured Loans", "Current Liabilities", "Duties & Taxes", "Provisions", "Sundry Creditors", "Fixed Assets", "Investments", "Current Assets", "Stock-in-hand", "Deposits (Asset)", "Loans & Advances (Asset)", "Bank Accounts", "Cash-in-hand", "Sundry Debtors", "Misc. Expenses (ASSET)", "Suspense Account", "Branch / Divisions", "Sales Accounts", "Purchase Accounts", "Direct Incomes", "Indirect Incomes", "Direct Expenses", "Indirect Expenses"}
 
-# Core Helper Functions (Line-for-line with app1.py)
+# Core Helper Functions (Exact logic from app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -58,8 +53,8 @@ def first_non_empty_text(elem, names):
 def first_descendant_text(elem, local_name):
     for child in elem.iter():
         if strip_ns(child.tag).upper() == local_name.upper():
-            v = clean_text(child.text)
-            if v: return v
+            val = clean_text(child.text)
+            if val: return val
     return ""
 
 def to_decimal(value, default=Decimal("0.00")):
@@ -97,8 +92,8 @@ def ledger_primary_group(ledger_name, ledger_meta):
         current = p
     return ""
 
-def post_to_tally(url, xml_text, timeout=120):
-    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=timeout)
+def post_to_tally(url, xml_text):
+    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120)
     r.raise_for_status()
     return r.content.decode(r.encoding or "utf-8", errors="replace")
 
@@ -116,83 +111,62 @@ def fetch_tally_metadata(url, company):
     sv = f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>" if company else ""
     v_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>VT</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{sv}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"VT\"><TYPE>VoucherType</TYPE><FETCH>Name, Parent</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     g_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>GR</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>{sv}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"GR\"><TYPE>Group</TYPE><FETCH>Name, Parent, Nature, _PrimaryGroup</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    vm, gm = {}, {}
+    gm = {}
     try:
-        rv = ET.fromstring(xml_cleanup(post_to_tally(url, v_xml)))
-        for vt in rv.iter():
-            if strip_ns(vt.tag).upper() == "VOUCHERTYPE":
-                n, p = direct_child_text(vt, "NAME"), direct_child_text(vt, "PARENT")
-                if n: vm[n] = p or n
         rg = ET.fromstring(xml_cleanup(post_to_tally(url, g_xml)))
         for g in rg.iter():
             if strip_ns(g.tag).upper() == "GROUP":
                 n, p, nat, pri = direct_child_text(g, "NAME"), direct_child_text(g, "PARENT"), direct_child_text(g, "NATURE"), direct_child_text(g, "_PRIMARYGROUP")
                 if n: gm[n] = {"Parent": p, "Nature": nat, "PrimaryGroup": pri}
-        base_types = {"Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra", "Stock Journal"}
         for _ in range(5):
-            for vt_n, p_n in vm.items():
-                if p_n and p_n not in base_types and p_n in vm: vm[vt_n] = vm[p_n]
             for g_n, gi in gm.items():
                 p = gi.get("Parent")
                 if p and not gi.get("Nature") and p in gm: gi["Nature"] = gm[p].get("Nature")
                 if p and not gi.get("PrimaryGroup") and p in gm: gi["PrimaryGroup"] = gm[p].get("PrimaryGroup")
     except: pass
-    return vm, gm
+    return gm
 
-# Power BI Locking & CSV Caching
-cache_dir = tempfile.gettempdir()
-csv_file = os.path.join(cache_dir, f"tally_Ledger_{PORT}.csv")
-lock_file = os.path.join(cache_dir, f"tally_lock_{PORT}.lock")
-ready_file = os.path.join(cache_dir, f"tally_ready_Ledger_{PORT}.flag")
+# Acquire Sequential Lock (Prevents simultaneous Power BI hits)
+lock_file = os.path.join(tempfile.gettempdir(), f"tally_lock_{PORT}.lock")
+for _ in range(300):
+    try:
+        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd); break
+    except:
+        if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: os.remove(lock_file)
+        time.sleep(1)
 
-if os.path.exists(ready_file) and (time.time() - os.path.getmtime(ready_file)) < 300:
-    Ledger = pd.read_csv(csv_file)
-else:
-    # Acquire lock
-    for _ in range(120):
-        try:
-            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd); break
-        except:
-            if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: 
-                try: os.remove(lock_file)
-                except: pass
-            time.sleep(1)
-            if os.path.exists(ready_file) and (time.time() - os.path.getmtime(ready_file)) < 300:
-                Ledger = pd.read_csv(csv_file); break
-    else:
-        try:
-            if os.path.exists(ready_file): os.remove(ready_file)
-            url = f"http://{HOST}:{PORT}"
-            det_name, det_start, det_end = get_company_info(HOST, PORT)
-            sel_comp = COMPANY or det_name
-            _, group_map = fetch_tally_metadata(url, sel_comp)
-            l_xml = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>L</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"L\"><TYPE>Ledger</TYPE><FETCH>Name, Parent, PartyGSTIN, MasterID, StartingFrom, CurrencyName, StateName, OpeningBalance, ClosingBalance, IncomeTaxNumber</FETCH><COMPUTE>PrimaryGroup:$_PrimaryGroup</COMPUTE><COMPUTE>CurrencyFormalName:$FormalName:Currency:$CurrencyName</COMPUTE><COMPUTE>CurrencySymbol:$UnicodeSymbol:Currency:$CurrencyName</COMPUTE><COMPUTE>CurrencyOriginalSymbol:$OriginalSymbol:Currency:$CurrencyName</COMPUTE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-            root = ET.fromstring(xml_cleanup(post_to_tally(url, l_xml)))
-            ledger_rows, ledger_lookup = [], {}
-            for elem in root.iter():
-                if strip_ns(elem.tag).upper() != "LEDGER": continue
-                name = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
-                if not name: continue
-                p = direct_child_text(elem, "PARENT"); gi = group_map.get(p, {})
-                row = {"MasterID": clean_text(elem.get("MASTERID")) or direct_child_text(elem, "MASTERID"), "Name": name, "PrimaryGroup": gi.get("PrimaryGroup") or first_non_empty_text(elem, ["PRIMARYGROUP"]), "Nature": "", "NatureOfGroup": gi.get("Nature", ""), "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]), "StartingFrom": direct_child_text(elem, "STARTINGFROM"), "CurrencyNameRaw": direct_child_text(elem, "CURRENCYNAME"), "CurrencyFormalNameRaw": direct_child_text(elem, "CURRENCYFORMALNAME"), "CurrencySymbolRaw": direct_child_text(elem, "CURRENCYSYMBOL"), "CurrencyOriginalSymbolRaw": direct_child_text(elem, "CURRENCYORIGINALSYMBOL"), "StateName": direct_child_text(elem, "STATENAME"), "Parent": p, "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"]), "OpeningBalance": to_float(first_non_empty_text(elem, ["OPENINGBALANCE"])), "ClosingBalance": to_float(first_non_empty_text(elem, ["CLOSINGBALANCE"]))}
-                ledger_rows.append(row); ledger_lookup[name] = row
-            for r in ledger_rows:
-                if not r["PrimaryGroup"]: r["PrimaryGroup"] = ledger_primary_group(r["Name"], ledger_lookup)
-                pg = r["PrimaryGroup"]
-                if not r["NatureOfGroup"] and pg: r["NatureOfGroup"] = group_map.get(pg, {}).get("Nature", "")
-                if r["NatureOfGroup"]:
-                    nv = r["NatureOfGroup"].lower()
-                    if nv in ["assets", "liabilities"]: r["Nature"] = "BS"
-                    elif nv in ["income", "expenses"]: r["Nature"] = "PL"
-                if not r["Nature"] and pg:
-                    bs_pl, nog = nature_from_primary_group(pg)
-                    r["Nature"], r["NatureOfGroup"] = bs_pl, nog
-                cur_k = clean_text(r.get("CurrencyFormalNameRaw") or r.get("CurrencyNameRaw")).upper()
-                r["CurrencyName"] = CURRENCY_SYMBOL_FALLBACKS.get(cur_k, clean_text(r.get("CurrencySymbolRaw") or r.get("CurrencyOriginalSymbolRaw")))
-            Ledger = pd.DataFrame(ledger_rows, columns=LEDGER_COLUMNS)
-            Ledger['CompanyName'], Ledger['FromDate'], Ledger['ToDate'] = sel_comp, format_tally_date(det_start), format_tally_date(det_end)
-            Ledger = Ledger[LEDGER_COLUMNS]
-            Ledger.to_csv(csv_file, index=False)
-            with open(ready_file, 'w') as f: f.write("done")
-        finally:
-            if os.path.exists(lock_file): os.remove(lock_file)
+try:
+    url = f"http://{HOST}:{PORT}"
+    det_name, det_start, det_end = get_company_info(HOST, PORT)
+    sel_comp = COMPANY or det_name
+    group_map = fetch_tally_metadata(url, sel_comp)
+
+    l_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>L</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"L\"><TYPE>Ledger</TYPE><FETCH>Name, Parent, PartyGSTIN, MasterID, StartingFrom, CurrencyName, StateName, OpeningBalance, ClosingBalance, IncomeTaxNumber</FETCH><COMPUTE>PrimaryGroup:$_PrimaryGroup</COMPUTE><COMPUTE>CurrencyFormalName:$FormalName:Currency:$CurrencyName</COMPUTE><COMPUTE>CurrencySymbol:$UnicodeSymbol:Currency:$CurrencyName</COMPUTE><COMPUTE>CurrencyOriginalSymbol:$OriginalSymbol:Currency:$CurrencyName</COMPUTE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    root = ET.fromstring(xml_cleanup(post_to_tally(url, l_req)))
+    
+    ledger_rows, ledger_lookup = [], {}
+    for elem in root.iter():
+        if strip_ns(elem.tag).upper() != "LEDGER": continue
+        name = clean_text(elem.get("NAME")) or direct_child_text(elem, "NAME")
+        if not name: continue
+        p = direct_child_text(elem, "PARENT"); gi = group_map.get(p, {})
+        row = {"MasterID": clean_text(elem.get("MASTERID")) or direct_child_text(elem, "MASTERID"), "Name": name, "PrimaryGroup": gi.get("PrimaryGroup") or first_non_empty_text(elem, ["PRIMARYGROUP"]), "Nature": "", "NatureOfGroup": gi.get("Nature", ""), "PAN": first_non_empty_text(elem, ["INCOMETAXNUMBER", "PAN"]), "StartingFrom": direct_child_text(elem, "STARTINGFROM"), "CurrencyNameRaw": direct_child_text(elem, "CURRENCYNAME"), "CurrencyFormalNameRaw": direct_child_text(elem, "CURRENCYFORMALNAME"), "CurrencySymbolRaw": direct_child_text(elem, "CURRENCYSYMBOL"), "CurrencyOriginalSymbolRaw": direct_child_text(elem, "CURRENCYORIGINALSYMBOL"), "StateName": direct_child_text(elem, "STATENAME"), "Parent": p, "PartyGSTIN": first_non_empty_text(elem, ["PARTYGSTIN", "GSTIN"]), "OpeningBalance": to_float(first_non_empty_text(elem, ["OPENINGBALANCE"])), "ClosingBalance": to_float(first_non_empty_text(elem, ["CLOSINGBALANCE"]))}
+        ledger_rows.append(row); ledger_lookup[name] = row
+    for r in ledger_rows:
+        if not r["PrimaryGroup"]: r["PrimaryGroup"] = ledger_primary_group(r["Name"], ledger_lookup)
+        pg = r["PrimaryGroup"]
+        if not r["NatureOfGroup"] and pg: r["NatureOfGroup"] = group_map.get(pg, {}).get("Nature", "")
+        if r["NatureOfGroup"]:
+            nv = r["NatureOfGroup"].lower()
+            if nv in ["assets", "liabilities"]: r["Nature"] = "BS"
+            elif nv in ["income", "expenses"]: r["Nature"] = "PL"
+        if not r["Nature"] and pg:
+            bs_pl, nog = nature_from_primary_group(pg)
+            r["Nature"], r["NatureOfGroup"] = bs_pl, nog
+        cur_k = clean_text(r.get("CurrencyFormalNameRaw") or r.get("CurrencyNameRaw")).upper()
+        r["CurrencyName"] = CURRENCY_SYMBOL_FALLBACKS.get(cur_k, clean_text(r.get("CurrencySymbolRaw") or r.get("CurrencyOriginalSymbolRaw")))
+    Ledger = pd.DataFrame(ledger_rows, columns=LEDGER_COLUMNS)
+    Ledger['CompanyName'], Ledger['FromDate'], Ledger['ToDate'] = sel_comp, format_tally_date(det_start), format_tally_date(det_end)
+    Ledger = Ledger[LEDGER_COLUMNS]
+finally:
+    if os.path.exists(lock_file): os.remove(lock_file)

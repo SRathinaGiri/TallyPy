@@ -19,7 +19,7 @@ TO_DATE = ""      # YYYYMMDD
 ACCOUNTING_VOUCHER_TYPES = {"Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra"}
 VOUCHER_COLUMNS = ["Date", "VoucherTypeName", "BaseVoucherType", "VoucherNumber", "LedgerName", "MasterID", "Amount", "DrCr", "DebitAmount", "CreditAmount", "ParentLedger", "PrimaryGroup", "Nature", "NatureOfGroup", "PAN", "PartyLedgerName", "PartyGSTIN", "LedgerGSTIN", "VoucherNarration", "IsOptional", "CompanyName", "FromDate", "ToDate"]
 
-# Core Helper Functions (Line-for-line with app1.py)
+# Core Helpers (Line-for-line with app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -60,13 +60,24 @@ def to_decimal(value, default=Decimal("0.00")):
     try: return Decimal(matches[-1].group(0))
     except: return default
 
+def to_float(value):
+    return float(to_decimal(value))
+
 def format_tally_date(value):
     value = clean_text(value)
     if re.fullmatch(r"\d{8}", value): return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
     return value
 
-def post_to_tally(url, xml_text, timeout=120):
-    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=timeout)
+def nature_from_primary_group(pg):
+    pg = clean_text(pg).lower()
+    if pg in ["current assets", "fixed assets", "investments", "misc. expenses (asset)", "bank accounts", "cash-in-hand", "deposits (asset)", "loans & advances (asset)", "stock-in-hand", "sundry debtors"]: return "BS", "Assets"
+    elif pg in ["capital account", "current liabilities", "loans (liability)", "suspense account", "branch / divisions", "bank od a/c", "duties & taxes", "provisions", "reserves & surplus", "secured loans", "sundry creditors", "unsecured loans"]: return "BS", "Liabilities"
+    elif pg in ["direct incomes", "indirect incomes", "sales accounts"]: return "PL", "Income"
+    elif pg in ["direct expenses", "indirect expenses", "purchase accounts"]: return "PL", "Expenses"
+    return "Unknown", "Unknown"
+
+def post_to_tally(url, xml_text):
+    r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120)
     r.raise_for_status()
     return r.content.decode(r.encoding or "utf-8", errors="replace")
 
@@ -120,9 +131,7 @@ else:
         try:
             fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd); break
         except:
-            if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: 
-                try: os.remove(lock_file)
-                except: pass
+            if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: os.remove(lock_file)
             time.sleep(1)
             if os.path.exists(ready_file) and (time.time() - os.path.getmtime(ready_file)) < 300:
                 Journal = pd.read_csv(csv_file); break
@@ -153,14 +162,16 @@ else:
                 vtype = direct_child_text(v, "VOUCHERTYPENAME"); base_vt = v_map.get(vtype, vtype)
                 if base_vt not in ACCOUNTING_VOUCHER_TYPES: continue
                 vd, vn, v_nar = format_tally_date(direct_child_text(v, "DATE")), direct_child_text(v, "VOUCHERNUMBER"), first_non_empty_text(v, ["NARRATION", "VOUCHERNARRATION"])
-                entries = [c for c in list(v) if "LEDGERENTRIES.LIST" in strip_ns(c.tag).upper() or "ALLLEDGERENTRIES.LIST" in strip_ns(c.tag).upper()]
-                for ent in entries:
+                
+                # Fetch sub-entries manually matching app1.py
+                entry_nodes = [c for c in list(v) if "LEDGERENTRIES.LIST" in strip_ns(c.tag).upper() or "ALLLEDGERENTRIES.LIST" in strip_ns(c.tag).upper()]
+                for ent in entry_nodes:
                     ln = direct_child_text(ent, "LEDGERNAME"); amt_v = to_decimal(direct_child_text(ent, "AMOUNT"))
                     if not ln or amt_v == 0: continue
                     is_pos = direct_child_text(ent, "ISDEEMEDPOSITIVE").upper() == "YES"
                     signed = abs(amt_v) * (Decimal("-1") if is_pos else Decimal("1"))
-                    meta = l_meta.get(ln, {})
-                    rows.append({"Date": vd, "VoucherTypeName": vtype, "BaseVoucherType": base_vt, "VoucherNumber": vn, "LedgerName": ln, "MasterID": meta.get("MasterID", ""), "Amount": float(signed), "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0, "CreditAmount": float(abs(signed)) if signed > 0 else 0.0, "ParentLedger": meta.get("Parent", ""), "PrimaryGroup": meta.get("PrimaryGroup", ""), "Nature": meta.get("Nature", ""), "NatureOfGroup": meta.get("NatureOfGroup", ""), "PAN": meta.get("PAN", ""), "PartyLedgerName": direct_child_text(v, "PARTYLEDGERNAME"), "PartyGSTIN": direct_child_text(v, "PARTYGSTIN"), "LedgerGSTIN": meta.get("PartyGSTIN", ""), "VoucherNarration": v_nar, "IsOptional": direct_child_text(v, "ISOPTIONAL"), "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
+                    m = l_meta.get(ln, {})
+                    rows.append({"Date": vd, "VoucherTypeName": vtype, "BaseVoucherType": base_vt, "VoucherNumber": vn, "LedgerName": ln, "MasterID": m.get("MasterID", ""), "Amount": float(signed), "DrCr": "Dr" if signed < 0 else "Cr", "DebitAmount": float(abs(signed)) if signed < 0 else 0.0, "CreditAmount": float(abs(signed)) if signed > 0 else 0.0, "ParentLedger": m.get("Parent", ""), "PrimaryGroup": m.get("PrimaryGroup", ""), "Nature": m.get("Nature", ""), "NatureOfGroup": m.get("NatureOfGroup", ""), "PAN": m.get("PAN", ""), "PartyLedgerName": direct_child_text(v, "PARTYLEDGERNAME"), "PartyGSTIN": direct_child_text(v, "PARTYGSTIN"), "LedgerGSTIN": m.get("PartyGSTIN", ""), "VoucherNarration": v_nar, "IsOptional": direct_child_text(v, "ISOPTIONAL"), "CompanyName": sel_comp, "FromDate": format_tally_date(f_dt), "ToDate": format_tally_date(t_dt)})
             Journal = pd.DataFrame(rows, columns=VOUCHER_COLUMNS)
             Journal.to_csv(csv_file, index=False)
             with open(ready_file, 'w') as f: f.write("done")
