@@ -20,6 +20,9 @@ STOCK_ITEM_OUTPUT_COLUMNS = [
     "BasicValue",
     "BasicQty",
     "OpeningRate",
+    "CompanyName",
+    "FromDate",
+    "ToDate",
 ]
 
 def strip_ns(tag):
@@ -75,6 +78,18 @@ def post_to_tally(url, xml_text):
     response = requests.post(url, data=xml_text.encode("utf-8"), timeout=120)
     return response.text
 
+def direct_child_text(elem, local_name):
+    for child in list(elem):
+        if strip_ns(child.tag).upper() == local_name.upper():
+            return clean_text(child.text)
+    return ""
+
+def format_tally_date(value):
+    value = clean_text(value)
+    if re.fullmatch(r"\d{8}", value):
+        return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+    return value
+
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
     xml = (
@@ -82,18 +97,33 @@ def get_company_info(host, port):
         "<TYPE>COLLECTION</TYPE><ID>MyCompanyInfo</ID></HEADER><BODY><DESC>"
         "<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH></COLLECTION>"
+        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE>"
+        "<FETCH>Name, StartingFrom, EndingAt, Guid</FETCH>"
+        "<FILTER>IsActiveCompany</FILTER>"
+        "</COLLECTION>"
+        "<SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
     try:
-        r = requests.post(url, data=xml.encode("utf-8"), timeout=15)
-        root = ET.fromstring(xml_cleanup(r.text).encode("utf-8"))
-        cmp = root.find(".//COMPANY")
-        if cmp is not None:
-            name = clean_text(cmp.get("NAME")) or clean_text(cmp.findtext("NAME", ""))
-            start = clean_text(cmp.findtext("STARTINGFROM", ""))
-            end = clean_text(cmp.findtext("ENDINGAT", ""))
-            return name, start, end
+        r = requests.post(url, data=xml.encode("utf-8"), timeout=10)
+        cleaned = xml_cleanup(r.text)
+        root = ET.fromstring(cleaned.encode("utf-8"))
+        
+        for cmp in root.iter():
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                name = clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME")
+                start = direct_child_text(cmp, "STARTINGFROM")
+                end = direct_child_text(cmp, "ENDINGAT")
+                if name:
+                    return name, start, end
+
+        for cmp in root.iter():
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                name = clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME")
+                start = direct_child_text(cmp, "STARTINGFROM")
+                end = direct_child_text(cmp, "ENDINGAT")
+                if name:
+                    return name, start, end
     except:
         pass
     return "", "", ""
@@ -101,8 +131,9 @@ def get_company_info(host, port):
 
 # 1. Fetch
 url = f"http://{HOST}:{PORT}"
+COMPANY_NAME, START_DATE, END_DATE = get_company_info(HOST, PORT)
 if not COMPANY:
-    COMPANY, _, _ = get_company_info(HOST, PORT)
+    COMPANY = COMPANY_NAME
 
 static_vars = f"<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
 if COMPANY:
@@ -139,3 +170,11 @@ for elem in root.findall(".//STOCKITEM"):
     })
 
 dataset = pd.DataFrame(rows) if rows else pd.DataFrame(columns=STOCK_ITEM_OUTPUT_COLUMNS)
+dataset["CompanyName"] = COMPANY
+dataset["FromDate"] = format_tally_date(START_DATE)
+dataset["ToDate"] = format_tally_date(END_DATE)
+
+for column in STOCK_ITEM_OUTPUT_COLUMNS:
+    if column not in dataset.columns:
+        dataset[column] = ""
+dataset = dataset[STOCK_ITEM_OUTPUT_COLUMNS]

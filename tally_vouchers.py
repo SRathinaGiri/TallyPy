@@ -544,19 +544,33 @@ def get_company_info(host, port):
         "<TYPE>COLLECTION</TYPE><ID>MyCompanyInfo</ID></HEADER><BODY><DESC>"
         "<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH></COLLECTION>"
+        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE>"
+        "<FETCH>Name, StartingFrom, EndingAt, Guid</FETCH>"
+        "<FILTER>IsActiveCompany</FILTER>"
+        "</COLLECTION>"
+        "<SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
     try:
-        r = requests.post(url, data=xml.encode("utf-8"), timeout=15)
+        r = requests.post(url, data=xml.encode("utf-8"), timeout=10)
         cleaned = xml_cleanup(r.text)
         root = ET.fromstring(cleaned.encode("utf-8"))
-        cmp = root.find(".//COMPANY")
-        if cmp is not None:
-            name = clean_text(cmp.get("NAME")) or clean_text(cmp.findtext("NAME", ""))
-            start = clean_text(cmp.findtext("STARTINGFROM", ""))
-            end = clean_text(cmp.findtext("ENDINGAT", ""))
-            return name, start, end
+        
+        for cmp in root.iter():
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                name = clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME")
+                start = direct_child_text(cmp, "STARTINGFROM")
+                end = direct_child_text(cmp, "ENDINGAT")
+                if name:
+                    return name, start, end
+
+        for cmp in root.iter():
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                name = clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME")
+                start = direct_child_text(cmp, "STARTINGFROM")
+                end = direct_child_text(cmp, "ENDINGAT")
+                if name:
+                    return name, start, end
     except:
         pass
     return "", "", ""

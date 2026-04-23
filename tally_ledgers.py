@@ -24,6 +24,9 @@ LEDGER_OUTPUT_COLUMNS = [
     "PartyGSTIN",
     "OpeningBalance",
     "ClosingBalance",
+    "CompanyName",
+    "FromDate",
+    "ToDate",
 ]
 
 # 15 Primary + 13 Sub-groups from Tally documentation
@@ -392,19 +395,33 @@ def get_company_info(host, port):
         "<TYPE>COLLECTION</TYPE><ID>MyCompanyInfo</ID></HEADER><BODY><DESC>"
         "<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH></COLLECTION>"
+        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE>"
+        "<FETCH>Name, StartingFrom, EndingAt, Guid</FETCH>"
+        "<FILTER>IsActiveCompany</FILTER>"
+        "</COLLECTION>"
+        "<SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
     try:
-        r = requests.post(url, data=xml.encode("utf-8"), timeout=15)
+        r = requests.post(url, data=xml.encode("utf-8"), timeout=10)
         cleaned = xml_cleanup(r.text)
         root = ET.fromstring(cleaned.encode("utf-8"))
-        cmp = root.find(".//COMPANY")
-        if cmp is not None:
-            name = clean_text(cmp.get("NAME")) or clean_text(cmp.findtext("NAME", ""))
-            start = clean_text(cmp.findtext("STARTINGFROM", ""))
-            end = clean_text(cmp.findtext("ENDINGAT", ""))
-            return name, start, end
+        
+        for cmp in root.iter():
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                name = clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME")
+                start = direct_child_text(cmp, "STARTINGFROM")
+                end = direct_child_text(cmp, "ENDINGAT")
+                if name:
+                    return name, start, end
+
+        for cmp in root.iter():
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                name = clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME")
+                start = direct_child_text(cmp, "STARTINGFROM")
+                end = direct_child_text(cmp, "ENDINGAT")
+                if name:
+                    return name, start, end
     except:
         pass
     return "", "", ""
@@ -413,8 +430,8 @@ def get_company_info(host, port):
 def fetch_ledger_rows(host, port, company):
     url = f"http://{host}:{port}"
 
+    cmp_name, cmp_start, cmp_end = get_company_info(host, port)
     if not company:
-        cmp_name, _, _ = get_company_info(host, port)
         company = cmp_name
 
     group_map = fetch_tally_metadata(url, company)
@@ -426,16 +443,20 @@ def fetch_ledger_rows(host, port, company):
         raise ValueError(error_text)
 
     ledger_rows = parse_ledgers(ledger_root, group_map)
-    return build_ledger_rows(ledger_rows)
+    return build_ledger_rows(ledger_rows), company, cmp_start, cmp_end
 
 
-rows = fetch_ledger_rows(
+rows, final_company, final_start, final_end = fetch_ledger_rows(
     host=HOST,
     port=PORT,
     company=COMPANY,
 )
 
 dataset = pd.DataFrame(rows)
+dataset["CompanyName"] = final_company
+dataset["FromDate"] = format_tally_date(final_start)
+dataset["ToDate"] = format_tally_date(final_end)
+
 for column in LEDGER_OUTPUT_COLUMNS:
     if column not in dataset.columns:
         dataset[column] = ""
