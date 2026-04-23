@@ -105,6 +105,9 @@ LEDGER_COLUMNS = [
     "PartyGSTIN",
     "OpeningBalance",
     "ClosingBalance",
+    "CompanyName",
+    "FromDate",
+    "ToDate",
 ]
 
 STOCK_ITEM_COLUMNS = [
@@ -120,6 +123,9 @@ STOCK_ITEM_COLUMNS = [
     "ClosingBalance",
     "ClosingValue",
     "ClosingRate",
+    "CompanyName",
+    "FromDate",
+    "ToDate",
 ]
 
 STOCK_VOUCHER_COLUMNS = [
@@ -134,6 +140,8 @@ STOCK_VOUCHER_COLUMNS = [
     "BatchName",
     "VoucherNarration",
     "CompanyName",
+    "FromDate",
+    "ToDate",
 ]
 
 
@@ -660,27 +668,45 @@ def parse_inventory_entries(root, company):
 
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
+    # Requesting Company info specifically from the context of the active session
     xml = (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
         "<TYPE>COLLECTION</TYPE><ID>MyCompanyInfo</ID></HEADER><BODY><DESC>"
         "<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH></COLLECTION>"
+        "<COLLECTION NAME=\"MyCompanyInfo\"><TYPE>Company</TYPE>"
+        "<FETCH>Name, StartingFrom, EndingAt, Guid</FETCH>"
+        "<FILTER>IsActiveCompany</FILTER>"
+        "</COLLECTION>"
+        "<SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
     try:
-        r = requests.post(url, data=xml.encode("utf-8"), timeout=15)
-        # Using standardized cleanup logic
+        r = requests.post(url, data=xml.encode("utf-8"), timeout=10)
         cleaned = xml_cleanup(r.text)
         root = ET.fromstring(cleaned.encode("utf-8"))
-        cmp = root.find(".//COMPANY")
-        if cmp is not None:
-            name = clean_text(cmp.get("NAME")) or clean_text(cmp.findtext("NAME", ""))
-            start = clean_text(cmp.findtext("STARTINGFROM", ""))
-            end = clean_text(cmp.findtext("ENDINGAT", ""))
-            return name, start, end
-    except:
-        pass
+        
+        # Try to find the active company in the returned collection
+        for cmp in root.iter():
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                name = clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME")
+                start = direct_child_text(cmp, "STARTINGFROM")
+                end = direct_child_text(cmp, "ENDINGAT")
+                if name:
+                    return name, start, end
+
+        # Fallback: If filtered list is empty, try to get the first company found
+        for cmp in root.iter():
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                name = clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME")
+                start = direct_child_text(cmp, "STARTINGFROM")
+                end = direct_child_text(cmp, "ENDINGAT")
+                if name:
+                    return name, start, end
+
+    except Exception as e:
+        print(f"Error in get_company_info: {e}")
+    
     return "", "", ""
 
 
@@ -801,13 +827,28 @@ def load_tally_data(host, port, company, from_date, to_date):
     stock_item_df = pd.DataFrame(stock_item_rows)
     inventory_df = pd.DataFrame(inventory_rows)
 
-    for df, cols in [(voucher_df, VOUCHER_COLUMNS), (ledger_df, LEDGER_COLUMNS), (stock_item_df, STOCK_ITEM_COLUMNS), (inventory_df, STOCK_VOUCHER_COLUMNS)]:
+    f_from = format_tally_date(from_date)
+    f_to = format_tally_date(to_date)
+
+    # Populate and reorder columns
+    df_configs = [
+        (voucher_df, VOUCHER_COLUMNS),
+        (ledger_df, LEDGER_COLUMNS),
+        (stock_item_df, STOCK_ITEM_COLUMNS),
+        (inventory_df, STOCK_VOUCHER_COLUMNS)
+    ]
+
+    final_dfs = []
+    for df, cols in df_configs:
+        df["CompanyName"] = selected_company
+        df["FromDate"] = f_from
+        df["ToDate"] = f_to
         for column in cols:
             if column not in df.columns:
                 df[column] = ""
-        df = df[cols]
+        final_dfs.append(df[cols])
 
-    return selected_company, voucher_df, ledger_df, stock_item_df, inventory_df
+    return selected_company, from_date, to_date, *final_dfs
 
 
 def to_excel_bytes(voucher_df, ledger_df, stock_item_df, inventory_df):
@@ -842,6 +883,9 @@ with st.sidebar:
     from_date = st.text_input("From Date (YYYYMMDD, optional)", "")
     to_date = st.text_input("To Date (YYYYMMDD, optional)", "")
     load_btn = st.button("Load Tables", type="primary")
+    if st.button("Clear Cache"):
+        st.cache_data.clear()
+        st.info("Cache cleared.")
 
 if "voucher_df" not in st.session_state:
     st.session_state.voucher_df = None
@@ -849,15 +893,30 @@ if "voucher_df" not in st.session_state:
     st.session_state.stock_item_df = None
     st.session_state.inventory_df = None
     st.session_state.company_name = ""
+    st.session_state.from_date = ""
+    st.session_state.to_date = ""
 
 if load_btn:
     try:
-        company_name, vdf, ldf, sidf, ivdf = load_tally_data(host, port, company, from_date, to_date)
+        # Clear existing state for fresh load
+        st.session_state.company_name = ""
+        st.session_state.from_date = ""
+        st.session_state.to_date = ""
+
+        company_name, start_date, end_date, vdf, ldf, sidf, ivdf = load_tally_data(host, port, company, from_date, to_date)
+        
+        if not company_name:
+            st.error("❌ Failed to detect company name. Please enter it manually in the sidebar.")
+        
         st.session_state.voucher_df = vdf
         st.session_state.ledger_df = ldf
         st.session_state.stock_item_df = sidf
         st.session_state.inventory_df = ivdf
-        st.session_state.company_name = company_name
+        st.session_state.company_name = company_name or "Unknown Company"
+        st.session_state.from_date = start_date
+        st.session_state.to_date = end_date
+        
+        st.success(f"✅ Loaded: {st.session_state.company_name}")
     except Exception as exc:
         st.error(f"Error fetching data: {exc}")
 
@@ -867,7 +926,10 @@ sidf = st.session_state.stock_item_df
 ivdf = st.session_state.inventory_df
 
 if vdf is not None:
-    st.caption(f"Company: {st.session_state.company_name}")
+    c_name = st.session_state.company_name
+    f_date = format_tally_date(st.session_state.from_date) or "N/A"
+    t_date = format_tally_date(st.session_state.to_date) or "N/A"
+    st.caption(f"🏢 Company: **{c_name}** | 📅 Period: **{f_date}** to **{t_date}**")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Voucher Rows", len(vdf))
