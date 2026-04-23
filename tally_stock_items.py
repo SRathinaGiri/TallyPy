@@ -15,7 +15,7 @@ COMPANY = ""      # Leave blank to auto-detect
 
 STOCK_ITEM_COLUMNS = ["Name", "Parent", "Category", "LedgerName", "OpeningBalance", "OpeningValue", "BasicValue", "BasicQty", "OpeningRate", "ClosingBalance", "ClosingValue", "ClosingRate", "CompanyName", "FromDate", "ToDate"]
 
-# Core Helper Functions (Line-for-line with app1.py)
+# Core Helpers (Line-for-line with app1.py)
 def strip_ns(tag):
     if not isinstance(tag, str): return ""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -60,51 +60,51 @@ def format_tally_date(value):
 
 def post_to_tally(url, xml_text):
     r = requests.post(url, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=120)
-    r.raise_for_status()
-    return r.content.decode(r.encoding or "utf-8", errors="replace")
+    return r.text
 
 def get_company_info(host, port):
     url = f"http://{host}:{port}"
     xml = "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyC</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"MyC\"><TYPE>Company</TYPE><FETCH>Name, StartingFrom, EndingAt</FETCH><FILTER>IsActiveCompany</FILTER></COLLECTION><SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     try:
-        root = ET.fromstring(xml_cleanup(post_to_tally(url, xml)))
+        cleaned = xml_cleanup(post_to_tally(url, xml))
+        root = ET.fromstring(cleaned.encode("utf-8"))
         for cmp in root.iter():
-            if strip_ns(cmp.tag).upper() == "COMPANY": return direct_child_text(cmp, "NAME"), direct_child_text(cmp, "STARTINGFROM"), direct_child_text(cmp, "ENDINGAT")
+            if strip_ns(cmp.tag).upper() == "COMPANY":
+                return clean_text(cmp.get("NAME")) or direct_child_text(cmp, "NAME"), direct_child_text(cmp, "STARTINGFROM"), direct_child_text(cmp, "ENDINGAT")
     except: pass
     return "", "", ""
 
-# Power BI Locking & CSV Caching
-cache_dir = tempfile.gettempdir()
-csv_file = os.path.join(cache_dir, f"tally_StockItem_{PORT}.csv")
-lock_file = os.path.join(cache_dir, f"tally_lock_{PORT}.lock")
-ready_file = os.path.join(cache_dir, f"tally_ready_StockItem_{PORT}.flag")
+# Acquire Sequential Lock (Prevents simultaneous Power BI hits)
+lock_file = os.path.join(tempfile.gettempdir(), f"tally_lock_{PORT}.lock")
+for _ in range(300):
+    try:
+        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd); break
+    except:
+        if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: os.remove(lock_file)
+        time.sleep(1)
 
-if os.path.exists(ready_file) and (time.time() - os.path.getmtime(ready_file)) < 300:
-    StockItem = pd.read_csv(csv_file)
-else:
-    for _ in range(120):
-        try:
-            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd); break
-        except:
-            if os.path.exists(lock_file) and (time.time() - os.path.getmtime(lock_file)) > 600: os.remove(lock_file)
-            time.sleep(1)
-            if os.path.exists(ready_file) and (time.time() - os.path.getmtime(ready_file)) < 300:
-                StockItem = pd.read_csv(csv_file); break
-    else:
-        try:
-            if os.path.exists(ready_file): os.remove(ready_file)
-            url = f"http://{HOST}:{PORT}"
-            det_name, det_start, det_end = get_company_info(HOST, PORT)
-            sel_comp = COMPANY or det_name
-            si_req = f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>SI</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME=\"SI\"><TYPE>StockItem</TYPE><FETCH>Name, Parent, Category, LedgerName, OpeningBalance, OpeningValue, BasicValue, BasicQty, OpeningRate</FETCH><COMPUTE>ClosingBalance:$_ClosingBalance</COMPUTE><COMPUTE>ClosingValue:$_ClosingValue</COMPUTE><COMPUTE>ClosingRate:$_ClosingRate</COMPUTE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-            root = ET.fromstring(xml_cleanup(post_to_tally(url, si_req)))
-            si_rows = []
-            for elem in root.findall(".//STOCKITEM"):
-                n = clean_text(elem.get("NAME")) or elem.findtext("NAME", "")
-                if not n: continue
-                si_rows.append({"Name": n, "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": to_float(elem.findtext("OPENINGBALANCE", "0")), "OpeningValue": to_float(elem.findtext("OPENINGVALUE", "0")), "BasicValue": to_float(elem.findtext("BASICVALUE", "0")), "BasicQty": to_float(elem.findtext("BASICQTY", "0")), "OpeningRate": to_float(elem.findtext("OPENINGRATE", "0")), "ClosingBalance": to_float(elem.findtext("CLOSINGBALANCE", "0")), "ClosingValue": to_float(elem.findtext("CLOSINGVALUE", "0")), "ClosingRate": to_float(elem.findtext("CLOSINGRATE", "0")), "CompanyName": sel_comp, "FromDate": format_tally_date(det_start), "ToDate": format_tally_date(det_end)})
-            StockItem = pd.DataFrame(si_rows, columns=STOCK_ITEM_COLUMNS)
-            StockItem.to_csv(csv_file, index=False)
-            with open(ready_file, 'w') as f: f.write("done")
-        finally:
-            if os.path.exists(lock_file): os.remove(lock_file)
+try:
+    url = f"http://{HOST}:{PORT}"
+    det_name, det_start, det_end = get_company_info(HOST, PORT)
+    sel_comp = COMPANY or det_name
+
+    si_req = (
+        f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyStockItems</ID></HEADER><BODY><DESC><STATICVARIABLES>"
+        f"<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(sel_comp)}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE>"
+        f"<COLLECTION NAME=\"MyStockItems\"><TYPE>StockItem</TYPE>"
+        f"<FETCH>Name, Parent, Category, LedgerName, OpeningBalance, OpeningValue, BasicValue, BasicQty, OpeningRate</FETCH>"
+        f"<COMPUTE>ClosingBalance:$_ClosingBalance</COMPUTE><COMPUTE>ClosingValue:$_ClosingValue</COMPUTE><COMPUTE>ClosingRate:$_ClosingRate</COMPUTE>"
+        f"</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    )
+
+    root = ET.fromstring(xml_cleanup(post_to_tally(url, si_req)))
+    si_rows = []
+    for elem in root.findall(".//STOCKITEM"):
+        name = clean_text(elem.get("NAME")) or elem.findtext("NAME", "")
+        if not name: continue
+        si_rows.append({"Name": name, "Parent": direct_child_text(elem, "PARENT"), "Category": direct_child_text(elem, "CATEGORY"), "LedgerName": direct_child_text(elem, "LEDGERNAME"), "OpeningBalance": to_float(direct_child_text(elem, "OPENINGBALANCE")), "OpeningValue": to_float(direct_child_text(elem, "OPENINGVALUE")), "BasicValue": to_float(direct_child_text(elem, "BASICVALUE")), "BasicQty": to_float(direct_child_text(elem, "BASICQTY")), "OpeningRate": to_float(direct_child_text(elem, "OPENINGRATE")), "ClosingBalance": to_float(direct_child_text(elem, "CLOSINGBALANCE")), "ClosingValue": to_float(direct_child_text(elem, "CLOSINGVALUE")), "ClosingRate": to_float(direct_child_text(elem, "CLOSINGRATE")), "CompanyName": sel_comp, "FromDate": format_tally_date(det_start), "ToDate": format_tally_date(det_end)})
+
+    StockItem = pd.DataFrame(si_rows, columns=STOCK_ITEM_COLUMNS)
+    StockItem = StockItem[STOCK_ITEM_COLUMNS]
+finally:
+    if os.path.exists(lock_file): os.remove(lock_file)
