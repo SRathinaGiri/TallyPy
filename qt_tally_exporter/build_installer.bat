@@ -4,10 +4,11 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 
+set /p APP_VERSION=<"%SCRIPT_DIR%\VERSION"
 set "DIST_DIR=%SCRIPT_DIR%\dist\TallyQtExporter"
 set "INSTALLER_DIR=%SCRIPT_DIR%\installer"
 set "STAGE_DIR=%INSTALLER_DIR%\stage"
-set "OUTPUT_EXE=%SCRIPT_DIR%\dist\TallyQtExporter_Setup.exe"
+set "OUTPUT_EXE=%SCRIPT_DIR%\dist\TallyQtExporter_Setup_v%APP_VERSION%.exe"
 set "ARCHIVE_FILE=%INSTALLER_DIR%\package.7z"
 set "CONFIG_FILE=%INSTALLER_DIR%\config.txt"
 set "SEVENZIP_EXE=C:\Program Files\7-Zip\7z.exe"
@@ -41,7 +42,7 @@ copy "%INSTALLER_DIR%\install.cmd" "%STAGE_DIR%\install.cmd" >nul
 
 (
 echo ;!@Install@!UTF-8!
-echo Title="Tally Qt Exporter Setup"
+echo Title="Tally Qt Exporter Setup v%APP_VERSION%"
 echo RunProgram="install.cmd"
 echo GUIMode="2"
 echo ;!@InstallEnd@!

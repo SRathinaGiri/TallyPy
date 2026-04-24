@@ -80,7 +80,7 @@ void MainWindow::buildUi() {
     detectedFromEdit_->setReadOnly(true);
     detectedToEdit_->setReadOnly(true);
     statusLabel_ = new QLabel("Ready", detailsBox);
-    statsLabel_ = new QLabel("Vouchers: 0 | Ledgers: 0 | Stock Items: 0 | Stock Vouchers: 0", detailsBox);
+    statsLabel_ = new QLabel("Vouchers: 0 | All Vouchers: 0 | Ledgers: 0 | Stock Items: 0 | Stock Vouchers: 0", detailsBox);
 
     detailsLayout->addWidget(new QLabel("Company", detailsBox), 0, 0);
     detailsLayout->addWidget(detectedCompanyEdit_, 0, 1);
@@ -95,11 +95,13 @@ void MainWindow::buildUi() {
     auto *exportButtonsLayout = new QHBoxLayout();
     auto *exportAllButton = new QPushButton("Export All CSVs", detailsBox);
     auto *exportVouchersButton = new QPushButton("Export Vouchers", detailsBox);
+    auto *exportAllVouchersButton = new QPushButton("Export All Vouchers", detailsBox);
     auto *exportLedgersButton = new QPushButton("Export Ledgers", detailsBox);
     auto *exportStockItemsButton = new QPushButton("Export Stock Items", detailsBox);
     auto *exportStockVouchersButton = new QPushButton("Export Stock Vouchers", detailsBox);
     exportButtonsLayout->addWidget(exportAllButton);
     exportButtonsLayout->addWidget(exportVouchersButton);
+    exportButtonsLayout->addWidget(exportAllVouchersButton);
     exportButtonsLayout->addWidget(exportLedgersButton);
     exportButtonsLayout->addWidget(exportStockItemsButton);
     exportButtonsLayout->addWidget(exportStockVouchersButton);
@@ -120,6 +122,7 @@ void MainWindow::buildUi() {
 
     const QList<TallyTable> tableDefs = {
         {"voucher_df", "Vouchers", "vouchers.csv", QStringList()},
+        {"all_voucher_df", "All Vouchers", "allvouchers.csv", QStringList()},
         {"ledger_df", "Ledgers", "ledgers.csv", QStringList()},
         {"stock_item_df", "Stock Items", "stock_items.csv", QStringList()},
         {"inventory_df", "Stock Vouchers", "stock_vouchers.csv", QStringList()},
@@ -147,6 +150,7 @@ void MainWindow::buildUi() {
     connect(loadButton, &QPushButton::clicked, this, [this]() { loadTables(); });
     connect(exportAllButton, &QPushButton::clicked, this, [this]() { exportAllTables(); });
     connect(exportVouchersButton, &QPushButton::clicked, this, [this]() { exportTable("voucher_df"); });
+    connect(exportAllVouchersButton, &QPushButton::clicked, this, [this]() { exportTable("all_voucher_df"); });
     connect(exportLedgersButton, &QPushButton::clicked, this, [this]() { exportTable("ledger_df"); });
     connect(exportStockItemsButton, &QPushButton::clicked, this, [this]() { exportTable("stock_item_df"); });
     connect(exportStockVouchersButton, &QPushButton::clicked, this, [this]() { exportTable("inventory_df"); });
@@ -219,6 +223,7 @@ void MainWindow::applyLoadedData(const TallyDataBundle &bundle) {
     detectedToEdit_->setText(formatRawDate(bundle.toDateRaw));
 
     int voucherCount = 0;
+    int allVoucherCount = 0;
     int ledgerCount = 0;
     int stockItemCount = 0;
     int inventoryCount = 0;
@@ -227,13 +232,15 @@ void MainWindow::applyLoadedData(const TallyDataBundle &bundle) {
         tables_[it.key()] = it.value();
         populateTableWidget(tableWidgets_.value(it.key()), it.value());
         if (it.key() == "voucher_df") voucherCount = it.value().rows.size();
+        if (it.key() == "all_voucher_df") allVoucherCount = it.value().rows.size();
         if (it.key() == "ledger_df") ledgerCount = it.value().rows.size();
         if (it.key() == "stock_item_df") stockItemCount = it.value().rows.size();
         if (it.key() == "inventory_df") inventoryCount = it.value().rows.size();
     }
 
-    statsLabel_->setText(QString("Vouchers: %1 | Ledgers: %2 | Stock Items: %3 | Stock Vouchers: %4")
+    statsLabel_->setText(QString("Vouchers: %1 | All Vouchers: %2 | Ledgers: %3 | Stock Items: %4 | Stock Vouchers: %5")
                              .arg(voucherCount)
+                             .arg(allVoucherCount)
                              .arg(ledgerCount)
                              .arg(stockItemCount)
                              .arg(inventoryCount));

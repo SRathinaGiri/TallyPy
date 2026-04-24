@@ -2,6 +2,8 @@
 
 Native Qt Widgets desktop app for exporting Tally data to CSV using the same XML request and parsing flow as `app1.py`.
 
+Current release version: `0.2.0`
+
 ## Build
 
 From this folder:
@@ -41,7 +43,7 @@ build_installer.bat
 
 This creates:
 
-`dist\TallyQtExporter_Setup.exe`
+`dist\TallyQtExporter_Setup_v0.2.0.exe`
 
 The installer copies the app to `C:\Program Files\Tally Qt Exporter` and creates Desktop and Start Menu shortcuts.
 
@@ -51,6 +53,7 @@ The installer copies the app to `C:\Program Files\Tally Qt Exporter` and creates
 - If company or dates are left blank, the app asks Tally for the active company and period
 - Exports available:
   - `vouchers.csv`
+  - `allvouchers.csv`
   - `ledgers.csv`
   - `stock_items.csv`
   - `stock_vouchers.csv`

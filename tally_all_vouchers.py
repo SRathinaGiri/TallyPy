@@ -472,4 +472,4 @@ def load_voucher_data(accounting_only=False):
     return df[ALL_VOUCHER_COLUMNS]
 
 
-Journal = load_voucher_data(accounting_only=True)
+AllVouchers = load_voucher_data(accounting_only=False)

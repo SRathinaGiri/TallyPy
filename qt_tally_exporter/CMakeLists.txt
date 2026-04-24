@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(TallyQtExporter LANGUAGES CXX)
+project(TallyQtExporter VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +25,10 @@ target_link_libraries(TallyQtExporter PRIVATE
     Qt6::Widgets
     Qt6::Network
     Qt6::Xml
+)
+
+target_compile_definitions(TallyQtExporter PRIVATE
+    APP_VERSION="${PROJECT_VERSION}"
 )
 
 set_target_properties(TallyQtExporter PROPERTIES

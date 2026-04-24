@@ -22,6 +22,69 @@ ACCOUNTING_VOUCHER_TYPES = {
     "Contra",
 }
 
+PREDEFINED_VOUCHER_TYPES = {
+    "Contra",
+    "Payment",
+    "Receipt",
+    "Journal",
+    "Sales",
+    "Purchase",
+    "Debit Note",
+    "Credit Note",
+    "Memorandum",
+    "Reversing Journal",
+    "Delivery Note",
+    "Receipt Note",
+    "Rejections In",
+    "Rejections Out",
+    "Stock Journal",
+    "Physical Stock",
+    "Material In",
+    "Material Out",
+    "Sales Order",
+    "Purchase Order",
+    "Job Work In Order",
+    "Job Work Out Order",
+    "Payroll",
+    "Attendance",
+}
+
+ACCOUNTING_BASE_VOUCHER_TYPES = {
+    "Contra",
+    "Payment",
+    "Receipt",
+    "Journal",
+    "Sales",
+    "Purchase",
+    "Debit Note",
+    "Credit Note",
+    "Memorandum",
+    "Reversing Journal",
+}
+
+INVENTORY_BASE_VOUCHER_TYPES = {
+    "Delivery Note",
+    "Receipt Note",
+    "Rejections In",
+    "Rejections Out",
+    "Stock Journal",
+    "Physical Stock",
+    "Material In",
+    "Material Out",
+}
+
+ORDER_BASE_VOUCHER_TYPES = {
+    "Sales Order",
+    "Purchase Order",
+    "Job Work In Order",
+    "Job Work Out Order",
+}
+
+PAYROLL_BASE_VOUCHER_TYPES = {
+    "Payroll",
+    "Attendance",
+}
+
 BS_PRIMARY_GROUPS = {
     "Capital Account", "Reserves & Surplus",
     "Loans (Liability)", "Bank OD A/c", "Secured Loans", "Unsecured Loans",
@@ -90,6 +153,8 @@ VOUCHER_COLUMNS = [
     "FromDate",
     "ToDate",
 ]
+
+ALL_VOUCHER_COLUMNS = VOUCHER_COLUMNS + ["VoucherCategory"]
 
 LEDGER_COLUMNS = [
     "MasterID",
@@ -246,6 +311,30 @@ def format_tally_date(value):
     return value
 
 
+def canonical_voucher_type_name(value):
+    value = clean_text(value)
+    lowered = value.lower()
+    aliases = {
+        "rejection in": "Rejections In",
+        "rejections in": "Rejections In",
+        "rejection out": "Rejections Out",
+        "rejections out": "Rejections Out",
+    }
+    return aliases.get(lowered, value)
+
+
+def voucher_category_from_base_type(base_v_type):
+    if base_v_type in ACCOUNTING_BASE_VOUCHER_TYPES:
+        return "Accounting"
+    if base_v_type in INVENTORY_BASE_VOUCHER_TYPES:
+        return "Inventory"
+    if base_v_type in ORDER_BASE_VOUCHER_TYPES:
+        return "Orders"
+    if base_v_type in PAYROLL_BASE_VOUCHER_TYPES:
+        return "Payroll"
+    return "Unknown"
+
+
 def nature_from_primary_group(primary_group):
     pg = clean_text(primary_group).lower()
     if pg in [
@@ -327,12 +416,6 @@ def build_voucher_request_xml(company, from_date, to_date):
         "<TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER><BODY><DESC>"
         f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        "<SYSTEM TYPE='Formulae' NAME='IsAccountingVoucher'>"
-        "($VoucherTypeName = \"Sales\") OR ($VoucherTypeName = \"Purchase\") OR "
-        "($VoucherTypeName = \"Journal\") OR ($VoucherTypeName = \"Receipt\") OR "
-        "($VoucherTypeName = \"Payment\") OR ($VoucherTypeName = \"Debit Note\") OR "
-        "($VoucherTypeName = \"Credit Note\")"
-        "</SYSTEM>"
         "<OBJECT NAME=\"All Ledger Entries\">"
         "<COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
         "<COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
@@ -345,7 +428,6 @@ def build_voucher_request_xml(company, from_date, to_date):
         "AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, "
         "AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, "
         "AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
-        "<FILTER>IsAccountingVoucher</FILTER>"
         "</COLLECTION>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
@@ -450,8 +532,8 @@ def fetch_tally_metadata(url, company):
         root_v = parse_xml_root(post_to_tally(url, vtype_xml))
         for vt in root_v.iter():
             if strip_ns(vt.tag).upper() == "VOUCHERTYPE":
-                name = direct_child_text(vt, "NAME")
-                parent = direct_child_text(vt, "PARENT")
+                name = canonical_voucher_type_name(clean_text(vt.get("NAME")) or direct_child_text(vt, "NAME"))
+                parent = canonical_voucher_type_name(direct_child_text(vt, "PARENT"))
                 if name:
                     vtype_map[name] = parent or name
 
@@ -469,7 +551,7 @@ def fetch_tally_metadata(url, company):
                         "PrimaryGroup": primary,
                     }
 
-        base_types = {"Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra", "Stock Journal"}
+        base_types = set(PREDEFINED_VOUCHER_TYPES)
         for _ in range(5):
             for vt_name, parent_name in list(vtype_map.items()):
                 if parent_name and parent_name not in base_types and parent_name in vtype_map:
@@ -562,10 +644,9 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=Non
         if strip_ns(voucher.tag).upper() != "VOUCHER":
             continue
 
-        voucher_type = direct_child_text(voucher, "VOUCHERTYPENAME")
-        base_v_type = vtype_map.get(voucher_type, voucher_type)
-        if base_v_type not in ACCOUNTING_VOUCHER_TYPES:
-            continue
+        voucher_type = canonical_voucher_type_name(direct_child_text(voucher, "VOUCHERTYPENAME"))
+        base_v_type = canonical_voucher_type_name(vtype_map.get(voucher_type, voucher_type))
+        voucher_category = voucher_category_from_base_type(base_v_type)
 
         voucher_date = format_tally_date(direct_child_text(voucher, "DATE"))
         voucher_number = direct_child_text(voucher, "VOUCHERNUMBER")
@@ -642,6 +723,7 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=Non
                 "CompanyName": voucher_company,
                 "FromDate": formatted_from_date,
                 "ToDate": formatted_to_date,
+                "VoucherCategory": voucher_category,
             })
 
     return rows
@@ -754,7 +836,12 @@ def load_tally_data(host, port, company, from_date, to_date):
     inventory_root = parse_xml_root(post_to_tally(url, build_inventory_entries_request_xml(selected_company, from_date, to_date)))
     inventory_rows = parse_inventory_entries(inventory_root, selected_company)
 
-    voucher_df = pd.DataFrame(voucher_rows)
+    all_voucher_df = pd.DataFrame(voucher_rows)
+    if all_voucher_df.empty:
+        all_voucher_df = pd.DataFrame(columns=ALL_VOUCHER_COLUMNS)
+        voucher_df = pd.DataFrame(columns=VOUCHER_COLUMNS)
+    else:
+        voucher_df = all_voucher_df[all_voucher_df["VoucherCategory"] == "Accounting"].copy()
     ledger_df = pd.DataFrame(ledger_rows)
     stock_item_df = pd.DataFrame(stock_item_rows)
     inventory_df = pd.DataFrame(inventory_rows)
@@ -765,6 +852,7 @@ def load_tally_data(host, port, company, from_date, to_date):
     final_dfs = []
     for df, columns in [
         (voucher_df, VOUCHER_COLUMNS),
+        (all_voucher_df, ALL_VOUCHER_COLUMNS),
         (ledger_df, LEDGER_COLUMNS),
         (stock_item_df, STOCK_ITEM_COLUMNS),
         (inventory_df, STOCK_VOUCHER_COLUMNS),
@@ -782,9 +870,10 @@ def load_tally_data(host, port, company, from_date, to_date):
         "from_date": from_date,
         "to_date": to_date,
         "voucher_df": final_dfs[0],
-        "ledger_df": final_dfs[1],
-        "stock_item_df": final_dfs[2],
-        "inventory_df": final_dfs[3],
+        "all_voucher_df": final_dfs[1],
+        "ledger_df": final_dfs[2],
+        "stock_item_df": final_dfs[3],
+        "inventory_df": final_dfs[4],
     }
 
 
@@ -798,10 +887,11 @@ class TallyDesktopApp:
         self.from_date_var = tk.StringVar()
         self.to_date_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
-        self.stats_var = tk.StringVar(value="Vouchers: 0 | Ledgers: 0 | Stock Items: 0 | Stock Vouchers: 0")
+        self.stats_var = tk.StringVar(value="Vouchers: 0 | All Vouchers: 0 | Ledgers: 0 | Stock Items: 0 | Stock Vouchers: 0")
 
         self.tables = {
             "voucher_df": pd.DataFrame(columns=VOUCHER_COLUMNS),
+            "all_voucher_df": pd.DataFrame(columns=ALL_VOUCHER_COLUMNS),
             "ledger_df": pd.DataFrame(columns=LEDGER_COLUMNS),
             "stock_item_df": pd.DataFrame(columns=STOCK_ITEM_COLUMNS),
             "inventory_df": pd.DataFrame(columns=STOCK_VOUCHER_COLUMNS),
@@ -870,6 +960,7 @@ class TallyDesktopApp:
         export_row.grid(row=5, column=0, columnspan=2, sticky="ew")
         ttk.Button(export_row, text="Export All CSVs", command=self.export_all_csvs).pack(side="left")
         ttk.Button(export_row, text="Export Vouchers", command=lambda: self.export_single_csv("voucher_df", "vouchers.csv")).pack(side="left", padx=4)
+        ttk.Button(export_row, text="Export All Vouchers", command=lambda: self.export_single_csv("all_voucher_df", "allvouchers.csv")).pack(side="left", padx=4)
         ttk.Button(export_row, text="Export Ledgers", command=lambda: self.export_single_csv("ledger_df", "ledgers.csv")).pack(side="left", padx=4)
         ttk.Button(export_row, text="Export Stock Items", command=lambda: self.export_single_csv("stock_item_df", "stock_items.csv")).pack(side="left", padx=4)
         ttk.Button(export_row, text="Export Stock Vouchers", command=lambda: self.export_single_csv("inventory_df", "stock_vouchers.csv")).pack(side="left", padx=4)
@@ -889,6 +980,7 @@ class TallyDesktopApp:
 
         for title, key, columns in [
             ("Vouchers", "voucher_df", VOUCHER_COLUMNS),
+            ("All Vouchers", "all_voucher_df", ALL_VOUCHER_COLUMNS),
             ("Ledgers", "ledger_df", LEDGER_COLUMNS),
             ("Stock Items", "stock_item_df", STOCK_ITEM_COLUMNS),
             ("Stock Vouchers", "inventory_df", STOCK_VOUCHER_COLUMNS),
@@ -997,7 +1089,7 @@ class TallyDesktopApp:
             self._populate_tree(self.treeviews[key], data[key])
 
         self.stats_var.set(
-            f"Vouchers: {len(data['voucher_df'])} | Ledgers: {len(data['ledger_df'])} | "
+            f"Vouchers: {len(data['voucher_df'])} | All Vouchers: {len(data['all_voucher_df'])} | Ledgers: {len(data['ledger_df'])} | "
             f"Stock Items: {len(data['stock_item_df'])} | Stock Vouchers: {len(data['inventory_df'])}"
         )
         self._set_status(f"Loaded data for {data['company_name']}")
@@ -1040,6 +1132,7 @@ class TallyDesktopApp:
 
         file_map = {
             "voucher_df": "vouchers.csv",
+            "all_voucher_df": "allvouchers.csv",
             "ledger_df": "ledgers.csv",
             "stock_item_df": "stock_items.csv",
             "inventory_df": "stock_vouchers.csv",

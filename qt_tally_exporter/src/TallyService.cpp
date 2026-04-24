@@ -26,6 +26,58 @@ const QSet<QString> kAccountingVoucherTypes = {
     "Debit Note",
     "Credit Note",
     "Contra",
+    "Memorandum",
+    "Reversing Journal",
+};
+
+const QSet<QString> kPredefinedVoucherTypes = {
+    "Contra",
+    "Payment",
+    "Receipt",
+    "Journal",
+    "Sales",
+    "Purchase",
+    "Debit Note",
+    "Credit Note",
+    "Memorandum",
+    "Reversing Journal",
+    "Delivery Note",
+    "Receipt Note",
+    "Rejections In",
+    "Rejections Out",
+    "Stock Journal",
+    "Physical Stock",
+    "Material In",
+    "Material Out",
+    "Sales Order",
+    "Purchase Order",
+    "Job Work In Order",
+    "Job Work Out Order",
+    "Payroll",
+    "Attendance",
+};
+
+const QSet<QString> kInventoryVoucherTypes = {
+    "Delivery Note",
+    "Receipt Note",
+    "Rejections In",
+    "Rejections Out",
+    "Stock Journal",
+    "Physical Stock",
+    "Material In",
+    "Material Out",
+};
+
+const QSet<QString> kOrderVoucherTypes = {
+    "Sales Order",
+    "Purchase Order",
+    "Job Work In Order",
+    "Job Work Out Order",
+};
+
+const QSet<QString> kPayrollVoucherTypes = {
+    "Payroll",
+    "Attendance",
 };
 
 const QSet<QString> kBsPrimaryGroups = {
@@ -81,6 +133,14 @@ const QStringList kVoucherColumns = {
     "PrimaryGroup", "Nature", "NatureOfGroup", "PAN", "PartyLedgerName",
     "PartyGSTIN", "LedgerGSTIN", "VoucherNarration", "IsOptional", "CompanyName",
     "FromDate", "ToDate"
+};
+
+const QStringList kAllVoucherColumns = {
+    "Date", "VoucherTypeName", "BaseVoucherType", "VoucherNumber", "LedgerName",
+    "MasterID", "Amount", "DrCr", "DebitAmount", "CreditAmount", "ParentLedger",
+    "PrimaryGroup", "Nature", "NatureOfGroup", "PAN", "PartyLedgerName",
+    "PartyGSTIN", "LedgerGSTIN", "VoucherNarration", "IsOptional", "CompanyName",
+    "FromDate", "ToDate", "VoucherCategory"
 };
 
 const QStringList kLedgerColumns = {
@@ -243,6 +303,34 @@ QString formatTallyDate(const QString &value) {
     return text;
 }
 
+QString canonicalVoucherTypeName(const QString &value) {
+    const QString cleaned = cleanText(value);
+    const QString lowered = cleaned.toLower();
+    if (lowered == "rejection in" || lowered == "rejections in") {
+        return "Rejections In";
+    }
+    if (lowered == "rejection out" || lowered == "rejections out") {
+        return "Rejections Out";
+    }
+    return cleaned;
+}
+
+QString voucherCategoryFromBaseType(const QString &baseType) {
+    if (kAccountingVoucherTypes.contains(baseType)) {
+        return "Accounting";
+    }
+    if (kInventoryVoucherTypes.contains(baseType)) {
+        return "Inventory";
+    }
+    if (kOrderVoucherTypes.contains(baseType)) {
+        return "Orders";
+    }
+    if (kPayrollVoucherTypes.contains(baseType)) {
+        return "Payroll";
+    }
+    return "Unknown";
+}
+
 QString escapeXml(const QString &value) {
     QString escaped = value.toHtmlEscaped();
     escaped.replace('\'', "&apos;");
@@ -391,12 +479,6 @@ QString buildVoucherRequestXml(const QString &company, const QString &fromDate, 
         "<TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER><BODY><DESC>"
         + QString("<STATICVARIABLES>%1</STATICVARIABLES>").arg(staticVars.join(""))
         + "<TDL><TDLMESSAGE>"
-        "<SYSTEM TYPE='Formulae' NAME='IsAccountingVoucher'>"
-        "($VoucherTypeName = \"Sales\") OR ($VoucherTypeName = \"Purchase\") OR "
-        "($VoucherTypeName = \"Journal\") OR ($VoucherTypeName = \"Receipt\") OR "
-        "($VoucherTypeName = \"Payment\") OR ($VoucherTypeName = \"Debit Note\") OR "
-        "($VoucherTypeName = \"Credit Note\")"
-        "</SYSTEM>"
         "<OBJECT NAME=\"All Ledger Entries\">"
         "<COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
         "<COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
@@ -409,7 +491,6 @@ QString buildVoucherRequestXml(const QString &company, const QString &fromDate, 
         "AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, "
         "AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, "
         "AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
-        "<FILTER>IsAccountingVoucher</FILTER>"
         "</COLLECTION>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     );
@@ -494,8 +575,8 @@ QPair<QMap<QString, QString>, QMap<QString, GroupInfo>> fetchTallyMetadata(const
         QDomNodeList vtypes = vtypeDoc.elementsByTagName("VOUCHERTYPE");
         for (int i = 0; i < vtypes.size(); ++i) {
             const QDomElement elem = vtypes.at(i).toElement();
-            const QString name = directChildText(elem, "NAME");
-            const QString parent = directChildText(elem, "PARENT");
+            const QString name = canonicalVoucherTypeName(cleanText(elem.attribute("NAME").isEmpty() ? directChildText(elem, "NAME") : elem.attribute("NAME")));
+            const QString parent = canonicalVoucherTypeName(directChildText(elem, "PARENT"));
             if (!name.isEmpty()) {
                 vtypeMap.insert(name, parent.isEmpty() ? name : parent);
             }
@@ -515,13 +596,10 @@ QPair<QMap<QString, QString>, QMap<QString, GroupInfo>> fetchTallyMetadata(const
             }
         }
 
-        const QSet<QString> baseTypes = {
-            "Sales", "Purchase", "Journal", "Receipt", "Payment", "Debit Note", "Credit Note", "Contra", "Stock Journal"
-        };
         for (int pass = 0; pass < 5; ++pass) {
             for (auto it = vtypeMap.begin(); it != vtypeMap.end(); ++it) {
                 const QString parentName = it.value();
-                if (!parentName.isEmpty() && !baseTypes.contains(parentName) && vtypeMap.contains(parentName)) {
+                if (!parentName.isEmpty() && !kPredefinedVoucherTypes.contains(parentName) && vtypeMap.contains(parentName)) {
                     it.value() = vtypeMap.value(parentName);
                 }
             }
@@ -658,11 +736,9 @@ QVector<QVariantMap> parseVouchers(const QDomDocument &doc, const QMap<QString, 
             continue;
         }
 
-        const QString voucherType = directChildText(voucher, "VOUCHERTYPENAME");
-        const QString baseType = vtypeMap.value(voucherType, voucherType);
-        if (!kAccountingVoucherTypes.contains(baseType)) {
-            continue;
-        }
+        const QString voucherType = canonicalVoucherTypeName(directChildText(voucher, "VOUCHERTYPENAME"));
+        const QString baseType = canonicalVoucherTypeName(vtypeMap.value(voucherType, voucherType));
+        const QString voucherCategory = voucherCategoryFromBaseType(baseType);
 
         const QString voucherDate = formatTallyDate(directChildText(voucher, "DATE"));
         const QString voucherNumber = directChildText(voucher, "VOUCHERNUMBER");
@@ -741,6 +817,7 @@ QVector<QVariantMap> parseVouchers(const QDomDocument &doc, const QMap<QString, 
             row.insert("CompanyName", voucherCompany);
             row.insert("FromDate", formattedFromDate);
             row.insert("ToDate", formattedToDate);
+            row.insert("VoucherCategory", voucherCategory);
             rows.append(row);
         }
     }
@@ -953,7 +1030,13 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
         const QString errorText = firstDescendantText(voucherDoc.documentElement(), "LINEERROR");
         throw std::runtime_error((errorText.isEmpty() ? QString("Tally returned STATUS=0") : errorText).toStdString());
     }
-    const QVector<QVariantMap> voucherRows = parseVouchers(voucherDoc, ledgerMeta, selectedCompany, selectedFrom, selectedTo, vtypeMap);
+    const QVector<QVariantMap> allVoucherRows = parseVouchers(voucherDoc, ledgerMeta, selectedCompany, selectedFrom, selectedTo, vtypeMap);
+    QVector<QVariantMap> voucherRows;
+    for (const QVariantMap &row : allVoucherRows) {
+        if (row.value("VoucherCategory").toString() == "Accounting") {
+            voucherRows.append(row);
+        }
+    }
 
     const QDomDocument stockDoc = parseXmlRoot(postToTally(url, buildStockItemRequestXml(selectedCompany)));
     const QVector<QVariantMap> stockRows = parseStockItems(stockDoc);
@@ -966,6 +1049,7 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
     bundle.fromDateRaw = selectedFrom;
     bundle.toDateRaw = selectedTo;
     bundle.tables.insert("voucher_df", makeTable("voucher_df", "Vouchers", "vouchers.csv", kVoucherColumns, voucherRows, selectedCompany, selectedFrom, selectedTo));
+    bundle.tables.insert("all_voucher_df", makeTable("all_voucher_df", "All Vouchers", "allvouchers.csv", kAllVoucherColumns, allVoucherRows, selectedCompany, selectedFrom, selectedTo));
     bundle.tables.insert("ledger_df", makeTable("ledger_df", "Ledgers", "ledgers.csv", kLedgerColumns, ledgerRows, selectedCompany, selectedFrom, selectedTo));
     bundle.tables.insert("stock_item_df", makeTable("stock_item_df", "Stock Items", "stock_items.csv", kStockItemColumns, stockRows, selectedCompany, selectedFrom, selectedTo));
     bundle.tables.insert("inventory_df", makeTable("inventory_df", "Stock Vouchers", "stock_vouchers.csv", kStockVoucherColumns, inventoryRows, selectedCompany, selectedFrom, selectedTo));
