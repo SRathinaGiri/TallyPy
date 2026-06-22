@@ -1,11 +1,18 @@
 #include "TallyService.h"
 
 #include <QByteArray>
+#include <QCryptographicHash>
+#include <QDate>
 #include <QEventLoop>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QMap>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QStandardPaths>
+#include <QThread>
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringConverter>
@@ -14,6 +21,7 @@
 #include <QDomDocument>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 
 namespace {
@@ -446,6 +454,173 @@ QString postToTally(const QString &url, const QString &xmlText, int timeoutMs = 
     return QString::fromUtf8(body);
 }
 
+QDate parseTallyDateValue(const QString &value) {
+    const QString text = cleanText(value);
+    if (text.isEmpty()) {
+        return {};
+    }
+    const QStringList formats = {"yyyyMMdd", "yyyy-MM-dd", "dd-MM-yyyy", "d-M-yyyy", "dd/MM/yyyy", "d/M/yyyy", "dd-MMM-yyyy", "d-MMM-yyyy", "dd-MMMM-yyyy", "d-MMMM-yyyy"};
+    for (const QString &format : formats) {
+        const QDate parsed = QDate::fromString(text, format);
+        if (parsed.isValid()) {
+            return parsed;
+        }
+    }
+    return {};
+}
+
+QString tallyRequestDate(const QString &value) {
+    const QDate parsed = parseTallyDateValue(value);
+    return parsed.isValid() ? parsed.toString("yyyyMMdd") : cleanText(value);
+}
+
+QVector<QPair<QString, QString>> splitPeriod(const QDate &startDate, const QDate &endDate, const QString &mode) {
+    QVector<QPair<QString, QString>> chunks;
+    QDate current = startDate;
+    while (current <= endDate) {
+        QDate chunkEnd;
+        if (mode == "weekly") {
+            chunkEnd = std::min(endDate, current.addDays(6));
+        } else if (mode == "daily") {
+            chunkEnd = current;
+        } else {
+            chunkEnd = std::min(endDate, QDate(current.year(), current.month(), current.daysInMonth()));
+        }
+        chunks.append({current.toString("yyyyMMdd"), chunkEnd.toString("yyyyMMdd")});
+        current = chunkEnd.addDays(1);
+    }
+    return chunks;
+}
+
+QString buildVoucherProbeRequestXml(const QString &company, const QString &fromDate, const QString &toDate) {
+    QStringList staticVars = {"<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"};
+    if (!company.isEmpty()) {
+        staticVars << QString("<SVCURRENTCOMPANY>%1</SVCURRENTCOMPANY>").arg(escapeXml(company));
+    }
+    staticVars << QString("<SVFROMDATE TYPE='Date'>%1</SVFROMDATE>").arg(escapeXml(tallyRequestDate(fromDate)));
+    staticVars << QString("<SVTODATE TYPE='Date'>%1</SVTODATE>").arg(escapeXml(tallyRequestDate(toDate)));
+    return (
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
+        "<TYPE>COLLECTION</TYPE><ID>MyVoucherProbe</ID></HEADER><BODY><DESC>"
+        + QString("<STATICVARIABLES>%1</STATICVARIABLES>").arg(staticVars.join(""))
+        + "<TDL><TDLMESSAGE><COLLECTION NAME=\"MyVoucherProbe\"><TYPE>Voucher</TYPE>"
+        "<FETCH>Date, MasterID, VoucherTypeName</FETCH>"
+        "</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    );
+}
+
+QVector<QPair<QString, QString>> planExportChunks(const QString &url, const QString &company, const QString &fromDate, const QString &toDate) {
+    const QDate startDate = parseTallyDateValue(fromDate);
+    const QDate endDate = parseTallyDateValue(toDate);
+    if (!startDate.isValid() || !endDate.isValid() || startDate > endDate) {
+        return {{cleanText(fromDate), cleanText(toDate)}};
+    }
+
+    QString mode = "monthly";
+    try {
+        const QDomDocument doc = parseXmlRoot(postToTally(url, buildVoucherProbeRequestXml(company, fromDate, toDate), 180000));
+        const QDomNodeList vouchers = doc.elementsByTagName("VOUCHER");
+        QMap<QString, int> monthCounts;
+        for (int i = 0; i < vouchers.size(); ++i) {
+            const QDomElement voucher = vouchers.at(i).toElement();
+            const QDate voucherDate = parseTallyDateValue(directChildText(voucher, "DATE"));
+            if (voucherDate.isValid()) {
+                const QString key = QString("%1-%2").arg(voucherDate.year()).arg(voucherDate.month());
+                monthCounts[key] = monthCounts.value(key) + 1;
+            }
+        }
+        if (vouchers.size() <= 2000) {
+            return {{tallyRequestDate(fromDate), tallyRequestDate(toDate)}};
+        }
+        int maxMonthCount = 0;
+        for (int count : monthCounts) {
+            maxMonthCount = std::max(maxMonthCount, count);
+        }
+        mode = maxMonthCount <= 2000 ? "monthly" : "weekly";
+    } catch (...) {
+        mode = "monthly";
+    }
+
+    return splitPeriod(startDate, endDate, mode);
+}
+
+QString cacheFilePath(const QString &company, const QString &tableName, const QString &fromDate, const QString &toDate) {
+    QString cacheRoot = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    if (cacheRoot.isEmpty()) {
+        cacheRoot = QDir::currentPath() + "/.tally_cache";
+    } else {
+        cacheRoot += "/tally_xml";
+    }
+    const QString keyText = cleanText(company) + "|" + tableName + "|" + cleanText(fromDate) + "|" + cleanText(toDate) + "|xml-v2";
+    const QString fileName = QString(QCryptographicHash::hash(keyText.toUtf8(), QCryptographicHash::Sha1).toHex()) + ".xml";
+    return QDir(cacheRoot).filePath(fileName);
+}
+
+QString fetchXmlCached(const QString &url, const QString &xmlText, const QString &company, const QString &tableName,
+                       const QString &fromDate, const QString &toDate) {
+    const QString path = cacheFilePath(company, tableName, fromDate, toDate);
+    QFile existing(path);
+    if (existing.exists() && existing.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return QString::fromUtf8(existing.readAll());
+    }
+
+    std::exception_ptr lastError;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        try {
+            const QString xml = postToTally(url, xmlText);
+            QDir().mkpath(QFileInfo(path).absolutePath());
+            QFile file(path);
+            if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                file.write(xml.toUtf8());
+            }
+            return xml;
+        } catch (...) {
+            lastError = std::current_exception();
+            QThread::sleep(1 + attempt * 2);
+        }
+    }
+    if (lastError) {
+        std::rethrow_exception(lastError);
+    }
+    return {};
+}
+
+QVector<QVariantMap> fetchChunkedRows(
+    const QString &url,
+    const QString &company,
+    const QString &fromDate,
+    const QString &toDate,
+    const QString &tableName,
+    const std::function<QString(const QString &, const QString &, const QString &)> &buildRequest,
+    const std::function<QVector<QVariantMap>(const QDomDocument &, const QString &, const QString &)> &parseChunk) {
+    QVector<QVariantMap> rows;
+    for (const auto &chunk : planExportChunks(url, company, fromDate, toDate)) {
+        const QString chunkFrom = chunk.first;
+        const QString chunkTo = chunk.second;
+        try {
+            const QString xml = fetchXmlCached(url, buildRequest(company, chunkFrom, chunkTo), company, tableName, chunkFrom, chunkTo);
+            const QDomDocument doc = parseXmlRoot(xml);
+            const QString status = cleanText(firstDescendantText(doc.documentElement(), "STATUS"));
+            if (status == "0") {
+                const QString errorText = firstDescendantText(doc.documentElement(), "LINEERROR");
+                throw std::runtime_error((errorText.isEmpty() ? QString("Tally returned STATUS=0") : errorText).toStdString());
+            }
+            rows += parseChunk(doc, chunkFrom, chunkTo);
+        } catch (...) {
+            const QDate startDate = parseTallyDateValue(chunkFrom);
+            const QDate endDate = parseTallyDateValue(chunkTo);
+            if (!startDate.isValid() || !endDate.isValid() || startDate >= endDate) {
+                throw;
+            }
+            for (const auto &day : splitPeriod(startDate, endDate, "daily")) {
+                const QString xml = fetchXmlCached(url, buildRequest(company, day.first, day.second), company, tableName, day.first, day.second);
+                rows += parseChunk(parseXmlRoot(xml), day.first, day.second);
+            }
+        }
+    }
+    return rows;
+}
+
 QString buildLedgerRequestXml(const QString &company) {
     QStringList staticVars = {"<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"};
     if (!company.isEmpty()) {
@@ -472,8 +647,8 @@ QString buildVoucherRequestXml(const QString &company, const QString &fromDate, 
     if (!company.isEmpty()) {
         staticVars << QString("<SVCURRENTCOMPANY>%1</SVCURRENTCOMPANY>").arg(escapeXml(company));
     }
-    staticVars << QString("<SVFROMDATE TYPE='Date'>%1</SVFROMDATE>").arg(escapeXml(fromDate));
-    staticVars << QString("<SVTODATE TYPE='Date'>%1</SVTODATE>").arg(escapeXml(toDate));
+    staticVars << QString("<SVFROMDATE TYPE='Date'>%1</SVFROMDATE>").arg(escapeXml(tallyRequestDate(fromDate)));
+    staticVars << QString("<SVTODATE TYPE='Date'>%1</SVTODATE>").arg(escapeXml(tallyRequestDate(toDate)));
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
         "<TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER><BODY><DESC>"
@@ -521,8 +696,8 @@ QString buildInventoryEntriesRequestXml(const QString &company, const QString &f
     if (!company.isEmpty()) {
         staticVars << QString("<SVCURRENTCOMPANY>%1</SVCURRENTCOMPANY>").arg(escapeXml(company));
     }
-    staticVars << QString("<SVFROMDATE TYPE='Date'>%1</SVFROMDATE>").arg(escapeXml(fromDate));
-    staticVars << QString("<SVTODATE TYPE='Date'>%1</SVTODATE>").arg(escapeXml(toDate));
+    staticVars << QString("<SVFROMDATE TYPE='Date'>%1</SVFROMDATE>").arg(escapeXml(tallyRequestDate(fromDate)));
+    staticVars << QString("<SVTODATE TYPE='Date'>%1</SVTODATE>").arg(escapeXml(tallyRequestDate(toDate)));
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
         "<TYPE>COLLECTION</TYPE><ID>MyInventoryVouchers</ID></HEADER><BODY><DESC>"
@@ -1024,13 +1199,16 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
         ledgerMeta.insert(row.value("Name").toString(), row);
     }
 
-    const QDomDocument voucherDoc = parseXmlRoot(postToTally(url, buildVoucherRequestXml(selectedCompany, selectedFrom, selectedTo)));
-    const QString status = cleanText(firstDescendantText(voucherDoc.documentElement(), "STATUS"));
-    if (status == "0") {
-        const QString errorText = firstDescendantText(voucherDoc.documentElement(), "LINEERROR");
-        throw std::runtime_error((errorText.isEmpty() ? QString("Tally returned STATUS=0") : errorText).toStdString());
-    }
-    const QVector<QVariantMap> allVoucherRows = parseVouchers(voucherDoc, ledgerMeta, selectedCompany, selectedFrom, selectedTo, vtypeMap);
+    const QVector<QVariantMap> allVoucherRows = fetchChunkedRows(
+        url,
+        selectedCompany,
+        selectedFrom,
+        selectedTo,
+        "vouchers",
+        buildVoucherRequestXml,
+        [&](const QDomDocument &doc, const QString &chunkFrom, const QString &chunkTo) {
+            return parseVouchers(doc, ledgerMeta, selectedCompany, chunkFrom, chunkTo, vtypeMap);
+        });
     QVector<QVariantMap> voucherRows;
     for (const QVariantMap &row : allVoucherRows) {
         if (row.value("VoucherCategory").toString() == "Accounting") {
@@ -1041,8 +1219,16 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
     const QDomDocument stockDoc = parseXmlRoot(postToTally(url, buildStockItemRequestXml(selectedCompany)));
     const QVector<QVariantMap> stockRows = parseStockItems(stockDoc);
 
-    const QDomDocument inventoryDoc = parseXmlRoot(postToTally(url, buildInventoryEntriesRequestXml(selectedCompany, selectedFrom, selectedTo)));
-    const QVector<QVariantMap> inventoryRows = parseInventoryEntries(inventoryDoc, selectedCompany);
+    const QVector<QVariantMap> inventoryRows = fetchChunkedRows(
+        url,
+        selectedCompany,
+        selectedFrom,
+        selectedTo,
+        "inventory",
+        buildInventoryEntriesRequestXml,
+        [&](const QDomDocument &doc, const QString &, const QString &) {
+            return parseInventoryEntries(doc, selectedCompany);
+        });
 
     TallyDataBundle bundle;
     bundle.companyName = selectedCompany;

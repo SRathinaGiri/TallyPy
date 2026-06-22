@@ -1,4 +1,9 @@
+import calendar
+import hashlib
+import os
 import re
+import time
+from datetime import date, datetime, timedelta
 import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
@@ -253,6 +258,117 @@ def post_to_tally(url, xml_text):
     return response.text
 
 
+def parse_tally_date_value(value):
+    text = clean_text(value)
+    if not text:
+        return None
+    for fmt in ("%Y%m%d", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%d-%B-%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def tally_request_date(value):
+    parsed = parse_tally_date_value(value)
+    return parsed.strftime("%Y%m%d") if parsed else clean_text(value)
+
+
+def split_period(start_date, end_date, mode):
+    chunks = []
+    current = start_date
+    while current <= end_date:
+        if mode == "weekly":
+            chunk_end = min(end_date, current + timedelta(days=6))
+        elif mode == "daily":
+            chunk_end = current
+        else:
+            chunk_end = min(end_date, date(current.year, current.month, calendar.monthrange(current.year, current.month)[1]))
+        chunks.append((current, chunk_end))
+        current = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def build_voucher_probe_request_xml(company, from_date, to_date):
+    static_vars = [
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+        f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>",
+        f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE>",
+        f"<SVTODATE TYPE='Date'>{escape(tally_request_date(to_date))}</SVTODATE>",
+    ]
+    return (
+        f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyVoucherProbe</ID></HEADER>"
+        f"<BODY><DESC><STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES><TDL><TDLMESSAGE>"
+        f"<COLLECTION NAME=\"MyVoucherProbe\"><TYPE>Voucher</TYPE><FETCH>Date, MasterID, VoucherTypeName</FETCH></COLLECTION>"
+        f"</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    )
+
+
+def plan_export_chunks(url, company, from_date, to_date):
+    start_date = parse_tally_date_value(from_date)
+    end_date = parse_tally_date_value(to_date)
+    if not start_date or not end_date or start_date > end_date:
+        return [(clean_text(from_date), clean_text(to_date))]
+    try:
+        root = parse_xml_root(post_to_tally(url, build_voucher_probe_request_xml(company, from_date, to_date)))
+        total = 0
+        month_counts = {}
+        for voucher in root.iter():
+            if strip_ns(voucher.tag).upper() != "VOUCHER":
+                continue
+            total += 1
+            voucher_date = parse_tally_date_value(direct_child_text(voucher, "DATE"))
+            if voucher_date:
+                key = (voucher_date.year, voucher_date.month)
+                month_counts[key] = month_counts.get(key, 0) + 1
+        if total <= 2000:
+            return [(tally_request_date(from_date), tally_request_date(to_date))]
+        mode = "monthly" if max(month_counts.values() or [0]) <= 2000 else "weekly"
+    except Exception:
+        mode = "monthly"
+    return [(start.strftime("%Y%m%d"), end.strftime("%Y%m%d")) for start, end in split_period(start_date, end_date, mode)]
+
+
+def fetch_xml_cached(url, xml_text, company, table_name, from_date, to_date):
+    if os.environ.get("TALLYXML_DISABLE_CACHE") == "1":
+        return post_to_tally(url, xml_text)
+    cache_root = os.path.join(os.getcwd(), ".tally_cache")
+    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), "xml-v2"])
+    path = os.path.join(cache_root, hashlib.sha1(key_text.encode("utf-8", errors="ignore")).hexdigest() + ".xml")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    last_error = None
+    for attempt in range(3):
+        try:
+            xml = post_to_tally(url, xml_text)
+            os.makedirs(cache_root, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(xml)
+            return xml
+        except Exception as exc:
+            last_error = exc
+            time.sleep(1 + attempt * 2)
+    raise last_error
+
+
+def build_voucher_request_xml(company, from_date, to_date):
+    return (
+        f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER>"
+        f"<BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>"
+        f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(tally_request_date(to_date))}</SVTODATE></STATICVARIABLES>"
+        f"<TDL><TDLMESSAGE><OBJECT NAME=\"All Ledger Entries\">"
+        f"<COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
+        f"<COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
+        f"<COMPUTE>EntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
+        f"<COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
+        f"</OBJECT><COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
+        f"<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
+        f"</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    )
+
+
 def parse_xml_root(xml_text):
     cleaned = xml_cleanup(xml_text)
     return ET.fromstring(cleaned.encode("utf-8"))
@@ -446,20 +562,21 @@ def load_voucher_data(accounting_only=False):
     )
     ledger_meta = parse_ledgers(parse_xml_root(post_to_tally(url, ledger_request)), group_map)
 
-    voucher_request = (
-        f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER>"
-        f"<BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(selected_company)}</SVCURRENTCOMPANY>"
-        f"<SVFROMDATE TYPE='Date'>{escape(selected_from)}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(selected_to)}</SVTODATE></STATICVARIABLES>"
-        f"<TDL><TDLMESSAGE><OBJECT NAME=\"All Ledger Entries\">"
-        f"<COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
-        f"<COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
-        f"<COMPUTE>EntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
-        f"<COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
-        f"</OBJECT><COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
-        f"<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
-        f"</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
-    )
-    voucher_rows = parse_voucher_rows(parse_xml_root(post_to_tally(url, voucher_request)), ledger_meta, selected_company, selected_from, selected_to, vtype_map)
+    voucher_rows = []
+    for chunk_from, chunk_to in plan_export_chunks(url, selected_company, selected_from, selected_to):
+        try:
+            xml = fetch_xml_cached(url, build_voucher_request_xml(selected_company, chunk_from, chunk_to), selected_company, "vouchers", chunk_from, chunk_to)
+            voucher_rows.extend(parse_voucher_rows(parse_xml_root(xml), ledger_meta, selected_company, selected_from, selected_to, vtype_map))
+        except Exception:
+            start_date = parse_tally_date_value(chunk_from)
+            end_date = parse_tally_date_value(chunk_to)
+            if not start_date or not end_date or start_date >= end_date:
+                raise
+            for day_start, day_end in split_period(start_date, end_date, "daily"):
+                day_from = day_start.strftime("%Y%m%d")
+                day_to = day_end.strftime("%Y%m%d")
+                xml = fetch_xml_cached(url, build_voucher_request_xml(selected_company, day_from, day_to), selected_company, "vouchers", day_from, day_to)
+                voucher_rows.extend(parse_voucher_rows(parse_xml_root(xml), ledger_meta, selected_company, selected_from, selected_to, vtype_map))
 
     df = pd.DataFrame(voucher_rows)
     if df.empty:
