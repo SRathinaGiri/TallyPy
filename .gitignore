@@ -1,5 +1,6 @@
 __pycache__/
 .tally_cache/
+.tally_logs/
 *.pyc
 *.pyo
 *.pyd

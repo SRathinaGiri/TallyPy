@@ -8,8 +8,10 @@
 #include <QMap>
 #include <QPlainTextEdit>
 #include <QProgressBar>
+#include <QPushButton>
 #include <QTableWidget>
 #include <QTabWidget>
+#include <atomic>
 
 class MainWindow : public QMainWindow {
 public:
@@ -19,6 +21,9 @@ private:
     void buildUi();
     void connectToTally();
     void loadTables();
+    void cancelCurrentOperation();
+    void clearCache();
+    void clearLogs();
     void applyCompanyInfo(const CompanyInfo &info);
     void applyLoadedData(const TallyDataBundle &bundle);
     void exportTable(const QString &tableId);
@@ -28,6 +33,7 @@ private:
     void setBusy(bool busy);
     void setStatus(const QString &message);
     void logMessage(const QString &message);
+    QString createLogFilePath() const;
     QString formatRawDate(const QString &value) const;
 
     QLineEdit *hostEdit_;
@@ -41,8 +47,15 @@ private:
     QLabel *statusLabel_;
     QLabel *statsLabel_;
     QProgressBar *progressBar_;
+    QPushButton *connectButton_;
+    QPushButton *loadButton_;
+    QPushButton *cancelButton_;
+    QPushButton *clearCacheButton_;
+    QPushButton *clearLogsButton_;
     QPlainTextEdit *logEdit_;
     QTabWidget *tabWidget_;
+    QString logFilePath_;
+    std::atomic_bool operationRunning_{false};
 
     QMap<QString, TallyTable> tables_;
     QMap<QString, QTableWidget *> tableWidgets_;

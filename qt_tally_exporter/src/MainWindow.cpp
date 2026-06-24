@@ -10,10 +10,13 @@
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QMessageBox>
+#include <QMetaObject>
 #include <QPushButton>
 #include <QSplitter>
+#include <QStandardPaths>
 #include <QTextStream>
 #include <QVBoxLayout>
+#include <thread>
 
 namespace {
 QString csvEscape(const QString &value) {
@@ -30,6 +33,11 @@ MainWindow::MainWindow() {
     setWindowTitle("Tally Qt Exporter");
     resize(1320, 840);
     buildUi();
+    logFilePath_ = createLogFilePath();
+    TallyService::setLogCallback([this](const QString &message) {
+        QMetaObject::invokeMethod(this, [this, message]() { logMessage(message); }, Qt::QueuedConnection);
+    });
+    logMessage("Log file: " + logFilePath_);
     setStatus("Ready");
 }
 
@@ -59,10 +67,13 @@ void MainWindow::buildUi() {
     connectionLayout->addWidget(toDateEdit_, 4, 1);
 
     auto *buttonsLayout = new QHBoxLayout();
-    auto *connectButton = new QPushButton("Connect", connectionBox);
-    auto *loadButton = new QPushButton("Load Tables", connectionBox);
-    buttonsLayout->addWidget(connectButton);
-    buttonsLayout->addWidget(loadButton);
+    connectButton_ = new QPushButton("Connect", connectionBox);
+    loadButton_ = new QPushButton("Load Tables", connectionBox);
+    cancelButton_ = new QPushButton("Cancel", connectionBox);
+    cancelButton_->setEnabled(false);
+    buttonsLayout->addWidget(connectButton_);
+    buttonsLayout->addWidget(loadButton_);
+    buttonsLayout->addWidget(cancelButton_);
     buttonsLayout->addStretch(1);
     progressBar_ = new QProgressBar(connectionBox);
     progressBar_->setRange(0, 0);
@@ -70,6 +81,14 @@ void MainWindow::buildUi() {
     progressBar_->setFixedWidth(160);
     buttonsLayout->addWidget(progressBar_);
     connectionLayout->addLayout(buttonsLayout, 5, 0, 1, 2);
+
+    auto *maintenanceLayout = new QHBoxLayout();
+    clearCacheButton_ = new QPushButton("Clear Cache", connectionBox);
+    clearLogsButton_ = new QPushButton("Clear Logs", connectionBox);
+    maintenanceLayout->addWidget(clearCacheButton_);
+    maintenanceLayout->addWidget(clearLogsButton_);
+    maintenanceLayout->addStretch(1);
+    connectionLayout->addLayout(maintenanceLayout, 6, 0, 1, 2);
 
     auto *detailsBox = new QGroupBox("Detected", central);
     auto *detailsLayout = new QGridLayout(detailsBox);
@@ -146,8 +165,11 @@ void MainWindow::buildUi() {
     mainLayout->addWidget(splitter, 1);
     setCentralWidget(central);
 
-    connect(connectButton, &QPushButton::clicked, this, [this]() { connectToTally(); });
-    connect(loadButton, &QPushButton::clicked, this, [this]() { loadTables(); });
+    connect(connectButton_, &QPushButton::clicked, this, [this]() { connectToTally(); });
+    connect(loadButton_, &QPushButton::clicked, this, [this]() { loadTables(); });
+    connect(cancelButton_, &QPushButton::clicked, this, [this]() { cancelCurrentOperation(); });
+    connect(clearCacheButton_, &QPushButton::clicked, this, [this]() { clearCache(); });
+    connect(clearLogsButton_, &QPushButton::clicked, this, [this]() { clearLogs(); });
     connect(exportAllButton, &QPushButton::clicked, this, [this]() { exportAllTables(); });
     connect(exportVouchersButton, &QPushButton::clicked, this, [this]() { exportTable("voucher_df"); });
     connect(exportAllVouchersButton, &QPushButton::clicked, this, [this]() { exportTable("all_voucher_df"); });
@@ -157,48 +179,73 @@ void MainWindow::buildUi() {
 }
 
 void MainWindow::connectToTally() {
+    if (operationRunning_.load()) {
+        return;
+    }
     setBusy(true);
     setStatus("Connecting to Tally...");
-    QApplication::processEvents();
+    operationRunning_.store(true);
+    TallyService::resetCancellation();
+    const QString host = hostEdit_->text().trimmed();
+    const QString port = portEdit_->text().trimmed();
 
-    try {
-        const CompanyInfo info = TallyService::getCompanyInfo(hostEdit_->text().trimmed(), portEdit_->text().trimmed());
-        if (info.name.isEmpty()) {
-            throw std::runtime_error("Active company could not be detected.");
+    std::thread([this, host, port]() {
+        try {
+            const CompanyInfo info = TallyService::getCompanyInfo(host, port);
+            if (info.name.isEmpty()) {
+                throw std::runtime_error("Active company could not be detected.");
+            }
+            QMetaObject::invokeMethod(this, [this, info]() {
+                applyCompanyInfo(info);
+                setStatus("Connected to " + info.name);
+                setBusy(false);
+            }, Qt::QueuedConnection);
+        } catch (const std::exception &ex) {
+            const QString message = ex.what();
+            QMetaObject::invokeMethod(this, [this, message]() {
+                setStatus("Connect failed");
+                QMessageBox::critical(this, "Tally Qt Exporter", message);
+                logMessage(QString("Connect failed: %1").arg(message));
+                setBusy(false);
+            }, Qt::QueuedConnection);
         }
-        applyCompanyInfo(info);
-        setStatus("Connected to " + info.name);
-    } catch (const std::exception &ex) {
-        setStatus("Connect failed");
-        QMessageBox::critical(this, "Tally Qt Exporter", ex.what());
-        logMessage(QString("Connect failed: %1").arg(ex.what()));
-    }
-
-    setBusy(false);
+    }).detach();
 }
 
 void MainWindow::loadTables() {
+    if (operationRunning_.load()) {
+        return;
+    }
     setBusy(true);
     setStatus("Loading tables...");
-    QApplication::processEvents();
+    operationRunning_.store(true);
+    TallyService::resetCancellation();
+    const QString host = hostEdit_->text().trimmed();
+    const QString port = portEdit_->text().trimmed();
+    const QString company = companyEdit_->text().trimmed();
+    const QString fromDate = fromDateEdit_->text().trimmed();
+    const QString toDate = toDateEdit_->text().trimmed();
 
-    try {
-        const TallyDataBundle bundle = TallyService::loadAllData(
-            hostEdit_->text().trimmed(),
-            portEdit_->text().trimmed(),
-            companyEdit_->text().trimmed(),
-            fromDateEdit_->text().trimmed(),
-            toDateEdit_->text().trimmed()
-        );
-        applyLoadedData(bundle);
-        setStatus("Loaded data for " + bundle.companyName);
-    } catch (const std::exception &ex) {
-        setStatus("Load failed");
-        QMessageBox::critical(this, "Tally Qt Exporter", ex.what());
-        logMessage(QString("Load failed: %1").arg(ex.what()));
-    }
-
-    setBusy(false);
+    std::thread([this, host, port, company, fromDate, toDate]() {
+        try {
+            const TallyDataBundle bundle = TallyService::loadAllData(host, port, company, fromDate, toDate);
+            QMetaObject::invokeMethod(this, [this, bundle]() {
+                applyLoadedData(bundle);
+                setStatus("Loaded data for " + bundle.companyName);
+                setBusy(false);
+            }, Qt::QueuedConnection);
+        } catch (const std::exception &ex) {
+            const QString message = ex.what();
+            QMetaObject::invokeMethod(this, [this, message]() {
+                setStatus(message == "Operation cancelled by user." ? message : "Load failed");
+                if (message != "Operation cancelled by user.") {
+                    QMessageBox::critical(this, "Tally Qt Exporter", message);
+                }
+                logMessage(QString("Load stopped: %1").arg(message));
+                setBusy(false);
+            }, Qt::QueuedConnection);
+        }
+    }).detach();
 }
 
 void MainWindow::applyCompanyInfo(const CompanyInfo &info) {
@@ -215,6 +262,51 @@ void MainWindow::applyCompanyInfo(const CompanyInfo &info) {
     if (toDateEdit_->text().trimmed().isEmpty()) {
         toDateEdit_->setText(info.endDateRaw);
     }
+}
+
+void MainWindow::cancelCurrentOperation() {
+    if (!operationRunning_.load()) {
+        return;
+    }
+    logMessage("Cancel requested. Aborting active Tally request after the current network call stops.");
+    setStatus("Cancelling...");
+    TallyService::cancelCurrentOperation();
+}
+
+void MainWindow::clearCache() {
+    QString cacheRoot = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    if (cacheRoot.isEmpty()) {
+        cacheRoot = QDir::currentPath() + "/.tally_cache";
+    } else {
+        cacheRoot += "/tally_xml";
+    }
+    int removed = 0;
+    QDir dir(cacheRoot);
+    if (dir.exists()) {
+        const QFileInfoList files = dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
+        removed = files.size();
+        dir.removeRecursively();
+    }
+    logMessage(QString("Cache cleared. Removed %1 cached XML file(s).").arg(removed));
+    QMessageBox::information(this, "Cache Cleared", QString("Removed %1 cached XML file(s).").arg(removed));
+}
+
+void MainWindow::clearLogs() {
+    int removed = 0;
+    const QFileInfo currentLog(logFilePath_);
+    QDir dir(currentLog.absolutePath());
+    if (dir.exists()) {
+        const QFileInfoList files = dir.entryInfoList({"*.log"}, QDir::Files | QDir::NoDotAndDotDot);
+        for (const QFileInfo &file : files) {
+            if (QFile::remove(file.absoluteFilePath())) {
+                ++removed;
+            }
+        }
+    }
+    logEdit_->clear();
+    logFilePath_ = createLogFilePath();
+    logMessage(QString("Logs cleared. Removed %1 log file(s). New log file: %2").arg(removed).arg(logFilePath_));
+    QMessageBox::information(this, "Logs Cleared", QString("Removed %1 log file(s).").arg(removed));
 }
 
 void MainWindow::applyLoadedData(const TallyDataBundle &bundle) {
@@ -345,11 +437,17 @@ bool MainWindow::writeCsvFile(const QString &path, const TallyTable &table, QStr
 }
 
 void MainWindow::setBusy(bool busy) {
+    operationRunning_.store(busy);
     hostEdit_->setDisabled(busy);
     portEdit_->setDisabled(busy);
     companyEdit_->setDisabled(busy);
     fromDateEdit_->setDisabled(busy);
     toDateEdit_->setDisabled(busy);
+    connectButton_->setDisabled(busy);
+    loadButton_->setDisabled(busy);
+    clearCacheButton_->setDisabled(busy);
+    clearLogsButton_->setDisabled(busy);
+    cancelButton_->setEnabled(busy);
     for (auto it = tableWidgets_.begin(); it != tableWidgets_.end(); ++it) {
         it.value()->setDisabled(busy);
     }
@@ -362,8 +460,24 @@ void MainWindow::setStatus(const QString &message) {
 }
 
 void MainWindow::logMessage(const QString &message) {
-    const QString stamp = QDateTime::currentDateTime().toString("HH:mm:ss");
-    logEdit_->appendPlainText(QString("[%1] %2").arg(stamp, message));
+    const QString stamp = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
+    const QString line = QString("[%1] %2").arg(stamp, message);
+    logEdit_->appendPlainText(line);
+    if (!logFilePath_.isEmpty()) {
+        QFile file(logFilePath_);
+        if (file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append)) {
+            QTextStream out(&file);
+            out.setEncoding(QStringConverter::Utf8);
+            out << line << "\n";
+        }
+    }
+}
+
+QString MainWindow::createLogFilePath() const {
+    const QString logDirPath = QDir::currentPath() + "/.tally_logs";
+    QDir().mkpath(logDirPath);
+    const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+    return QDir(logDirPath).filePath(QString("tally_qt_exporter_%1.log").arg(stamp));
 }
 
 QString MainWindow::formatRawDate(const QString &value) const {

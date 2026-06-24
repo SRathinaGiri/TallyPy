@@ -20,8 +20,10 @@
 #include <QUrl>
 #include <QDomDocument>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 
 namespace {
@@ -87,6 +89,35 @@ const QSet<QString> kPayrollVoucherTypes = {
     "Payroll",
     "Attendance",
 };
+
+struct ExportChunk {
+    QString fromDate;
+    QString toDate;
+    int masterFrom = -1;
+    int masterTo = -1;
+    int expectedCount = -1;
+};
+
+std::atomic_bool gCancelRequested{false};
+std::function<void(const QString &)> gLogCallback;
+std::mutex gLogMutex;
+
+void checkCancelled() {
+    if (gCancelRequested.load()) {
+        throw std::runtime_error("Operation cancelled by user.");
+    }
+}
+
+void emitLog(const QString &message) {
+    std::function<void(const QString &)> callback;
+    {
+        std::lock_guard<std::mutex> lock(gLogMutex);
+        callback = gLogCallback;
+    }
+    if (callback) {
+        callback(message);
+    }
+}
 
 const QSet<QString> kBsPrimaryGroups = {
     "Capital Account", "Reserves & Surplus",
@@ -270,6 +301,40 @@ QString directChildText(const QDomElement &elem, const QString &localName) {
     return {};
 }
 
+bool isRealVoucher(const QDomElement &elem) {
+    if (stripNs(elem.tagName()).toUpper() != "VOUCHER") {
+        return false;
+    }
+    if (!elem.attribute("VCHKEY").isEmpty() || !elem.attribute("REMOTEID").isEmpty() || !elem.attribute("VCHTYPE").isEmpty()) {
+        return true;
+    }
+    return !directChildText(elem, "DATE").isEmpty()
+        || !directChildText(elem, "VOUCHERTYPENAME").isEmpty()
+        || !directChildText(elem, "VOUCHERNUMBER").isEmpty()
+        || !directChildText(elem, "MASTERID").isEmpty();
+}
+
+int voucherMasterId(const QDomElement &voucher) {
+    bool ok = false;
+    const int attrValue = cleanText(voucher.attribute("MASTERID")).toInt(&ok);
+    if (ok) {
+        return attrValue;
+    }
+    const int childValue = directChildText(voucher, "MASTERID").toInt(&ok);
+    return ok ? childValue : -1;
+}
+
+int countRealVouchers(const QDomDocument &doc) {
+    int count = 0;
+    const QDomNodeList vouchers = doc.elementsByTagName("VOUCHER");
+    for (int i = 0; i < vouchers.size(); ++i) {
+        if (isRealVoucher(vouchers.at(i).toElement())) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 QString firstDescendantText(const QDomElement &elem, const QString &localName) {
     const QString wanted = localName.toUpper();
     QDomNode node = elem.firstChild();
@@ -421,6 +486,7 @@ QString ledgerPrimaryGroup(const QString &ledgerName, const QMap<QString, QVaria
 }
 
 QString postToTally(const QString &url, const QString &xmlText, int timeoutMs = 120000) {
+    checkCancelled();
     QNetworkAccessManager manager;
     QNetworkRequest request{QUrl(url)};
     request.setHeader(QNetworkRequest::ContentTypeHeader, "text/xml; charset=utf-8");
@@ -433,7 +499,19 @@ QString postToTally(const QString &url, const QString &xmlText, int timeoutMs = 
     timer.setSingleShot(true);
     QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
     timer.start(timeoutMs);
+
+    QTimer cancelTimer;
+    QObject::connect(&cancelTimer, &QTimer::timeout, &loop, [&]() {
+        if (gCancelRequested.load()) {
+            reply->abort();
+            loop.quit();
+        }
+    });
+    cancelTimer.start(100);
     loop.exec();
+    cancelTimer.stop();
+
+    checkCancelled();
 
     if (timer.isActive()) {
         timer.stop();
@@ -451,6 +529,7 @@ QString postToTally(const QString &url, const QString &xmlText, int timeoutMs = 
     if (networkError != QNetworkReply::NoError) {
         throw std::runtime_error(QString("Tally request failed: %1").arg(errorText).toStdString());
     }
+    checkCancelled();
     return QString::fromUtf8(body);
 }
 
@@ -509,28 +588,64 @@ QString buildVoucherProbeRequestXml(const QString &company, const QString &fromD
     );
 }
 
-QVector<QPair<QString, QString>> planExportChunks(const QString &url, const QString &company, const QString &fromDate, const QString &toDate) {
+QVector<ExportChunk> buildMasterIdChunks(const QVector<int> &masterIds, const QDate &startDate, const QDate &endDate, int maxVouchers) {
+    QVector<int> ids = masterIds;
+    std::sort(ids.begin(), ids.end());
+    QVector<ExportChunk> chunks;
+    for (int index = 0; index < ids.size(); index += maxVouchers) {
+        const int endIndex = std::min(index + maxVouchers, static_cast<int>(ids.size()));
+        ExportChunk chunk;
+        chunk.fromDate = startDate.toString("yyyyMMdd");
+        chunk.toDate = endDate.toString("yyyyMMdd");
+        chunk.masterFrom = ids[index];
+        chunk.masterTo = ids[endIndex - 1];
+        chunk.expectedCount = endIndex - index;
+        chunks.append(chunk);
+    }
+    return chunks;
+}
+
+QVector<ExportChunk> planExportChunks(const QString &url, const QString &company, const QString &fromDate, const QString &toDate) {
     const QDate startDate = parseTallyDateValue(fromDate);
     const QDate endDate = parseTallyDateValue(toDate);
     if (!startDate.isValid() || !endDate.isValid() || startDate > endDate) {
-        return {{cleanText(fromDate), cleanText(toDate)}};
+        return {{cleanText(fromDate), cleanText(toDate), -1, -1, -1}};
     }
 
     QString mode = "monthly";
     try {
+        emitLog(QString("Probe started for %1 to %2").arg(formatTallyDate(fromDate), formatTallyDate(toDate)));
         const QDomDocument doc = parseXmlRoot(postToTally(url, buildVoucherProbeRequestXml(company, fromDate, toDate), 180000));
         const QDomNodeList vouchers = doc.elementsByTagName("VOUCHER");
         QMap<QString, int> monthCounts;
+        QVector<int> masterIds;
+        int realVoucherCount = 0;
         for (int i = 0; i < vouchers.size(); ++i) {
             const QDomElement voucher = vouchers.at(i).toElement();
+            if (!isRealVoucher(voucher)) {
+                continue;
+            }
+            ++realVoucherCount;
             const QDate voucherDate = parseTallyDateValue(directChildText(voucher, "DATE"));
             if (voucherDate.isValid()) {
                 const QString key = QString("%1-%2").arg(voucherDate.year()).arg(voucherDate.month());
                 monthCounts[key] = monthCounts.value(key) + 1;
             }
+            const int masterId = voucherMasterId(voucher);
+            if (masterId >= 0) {
+                masterIds.append(masterId);
+            }
         }
-        if (vouchers.size() <= 2000) {
-            return {{tallyRequestDate(fromDate), tallyRequestDate(toDate)}};
+        emitLog(QString("Probe completed. Voucher headers found: %1. MasterIDs found: %2.").arg(realVoucherCount).arg(masterIds.size()));
+        const int target = std::max(250, qEnvironmentVariableIntValue("TALLYXML_CHUNK_VOUCHERS") > 0 ? qEnvironmentVariableIntValue("TALLYXML_CHUNK_VOUCHERS") : 1000);
+        if (realVoucherCount <= target) {
+            emitLog(QString("Chunk plan: one full-period request because probe count is <= %1.").arg(target));
+            return {{tallyRequestDate(fromDate), tallyRequestDate(toDate), -1, -1, realVoucherCount}};
+        }
+        if (!masterIds.isEmpty()) {
+            QVector<ExportChunk> chunks = buildMasterIdChunks(masterIds, startDate, endDate, target);
+            emitLog(QString("Chunk plan: %1 MasterID chunk(s), target <= %2 probed vouchers each.").arg(chunks.size()).arg(target));
+            return chunks;
         }
         int maxMonthCount = 0;
         for (int count : monthCounts) {
@@ -539,26 +654,33 @@ QVector<QPair<QString, QString>> planExportChunks(const QString &url, const QStr
         mode = maxMonthCount <= 2000 ? "monthly" : "weekly";
     } catch (...) {
         mode = "monthly";
+        emitLog("Probe failed. Falling back to monthly chunks.");
     }
 
-    return splitPeriod(startDate, endDate, mode);
+    QVector<ExportChunk> chunks;
+    for (const auto &period : splitPeriod(startDate, endDate, mode)) {
+        chunks.append({period.first, period.second, -1, -1, -1});
+    }
+    emitLog(QString("Chunk plan: %1 %2 chunk(s).").arg(chunks.size()).arg(mode));
+    return chunks;
 }
 
-QString cacheFilePath(const QString &company, const QString &tableName, const QString &fromDate, const QString &toDate) {
+QString cacheFilePath(const QString &company, const QString &tableName, const ExportChunk &chunk) {
     QString cacheRoot = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
     if (cacheRoot.isEmpty()) {
         cacheRoot = QDir::currentPath() + "/.tally_cache";
     } else {
         cacheRoot += "/tally_xml";
     }
-    const QString keyText = cleanText(company) + "|" + tableName + "|" + cleanText(fromDate) + "|" + cleanText(toDate) + "|xml-v2";
+    const QString keyText = cleanText(company) + "|" + tableName + "|" + cleanText(chunk.fromDate) + "|" + cleanText(chunk.toDate)
+        + "|" + QString::number(chunk.masterFrom) + "|" + QString::number(chunk.masterTo) + "|xml-v5";
     const QString fileName = QString(QCryptographicHash::hash(keyText.toUtf8(), QCryptographicHash::Sha1).toHex()) + ".xml";
     return QDir(cacheRoot).filePath(fileName);
 }
 
 QString fetchXmlCached(const QString &url, const QString &xmlText, const QString &company, const QString &tableName,
-                       const QString &fromDate, const QString &toDate) {
-    const QString path = cacheFilePath(company, tableName, fromDate, toDate);
+                       const ExportChunk &chunk) {
+    const QString path = cacheFilePath(company, tableName, chunk);
     QFile existing(path);
     if (existing.exists() && existing.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return QString::fromUtf8(existing.readAll());
@@ -591,33 +713,89 @@ QVector<QVariantMap> fetchChunkedRows(
     const QString &fromDate,
     const QString &toDate,
     const QString &tableName,
-    const std::function<QString(const QString &, const QString &, const QString &)> &buildRequest,
+    const std::function<QString(const QString &, const QString &, const QString &, int, int)> &buildRequest,
     const std::function<QVector<QVariantMap>(const QDomDocument &, const QString &, const QString &)> &parseChunk) {
     QVector<QVariantMap> rows;
-    for (const auto &chunk : planExportChunks(url, company, fromDate, toDate)) {
-        const QString chunkFrom = chunk.first;
-        const QString chunkTo = chunk.second;
+    std::function<void(const ExportChunk &)> processChunk;
+    int chunkIndex = 0;
+    const QVector<ExportChunk> chunks = planExportChunks(url, company, fromDate, toDate);
+    emitLog(QString("%1: starting %2 chunk(s).").arg(tableName, QString::number(chunks.size())));
+    processChunk = [&](const ExportChunk &chunk) {
+        ++chunkIndex;
+        const QString chunkFrom = chunk.fromDate;
+        const QString chunkTo = chunk.toDate;
+        const bool logChunk = chunks.size() <= 20 || chunkIndex <= 5 || chunkIndex == chunks.size() || chunkIndex % 50 == 0;
         try {
-            const QString xml = fetchXmlCached(url, buildRequest(company, chunkFrom, chunkTo), company, tableName, chunkFrom, chunkTo);
+            if (logChunk) {
+                QString label = QString("%1/%2").arg(chunkIndex).arg(chunks.size());
+                if (chunk.masterFrom >= 0) {
+                    emitLog(QString("%1: chunk %2 started, MasterID %3-%4, expected vouchers %5.")
+                                .arg(tableName, label)
+                                .arg(chunk.masterFrom)
+                                .arg(chunk.masterTo)
+                                .arg(chunk.expectedCount));
+                } else {
+                    emitLog(QString("%1: chunk %2 started, %3 to %4.").arg(tableName, label, formatTallyDate(chunkFrom), formatTallyDate(chunkTo)));
+                }
+            }
+            const QString xml = fetchXmlCached(url, buildRequest(company, chunkFrom, chunkTo, chunk.masterFrom, chunk.masterTo), company, tableName, chunk);
             const QDomDocument doc = parseXmlRoot(xml);
             const QString status = cleanText(firstDescendantText(doc.documentElement(), "STATUS"));
             if (status == "0") {
                 const QString errorText = firstDescendantText(doc.documentElement(), "LINEERROR");
                 throw std::runtime_error((errorText.isEmpty() ? QString("Tally returned STATUS=0") : errorText).toStdString());
             }
+            if (chunk.masterFrom >= 0 && chunk.expectedCount >= 0) {
+                const int detailCount = countRealVouchers(doc);
+                if (detailCount < chunk.expectedCount) {
+                    throw std::runtime_error(QString("MasterID-filtered response returned %1 voucher header(s), expected %2.")
+                                                 .arg(detailCount)
+                                                 .arg(chunk.expectedCount)
+                                                 .toStdString());
+                }
+            }
+            const int beforeRows = rows.size();
             rows += parseChunk(doc, chunkFrom, chunkTo);
+            if (logChunk) {
+                emitLog(QString("%1: chunk parsed %2 row(s) from %3 voucher header(s). Total rows: %4.")
+                            .arg(tableName)
+                            .arg(rows.size() - beforeRows)
+                            .arg(countRealVouchers(doc))
+                            .arg(rows.size()));
+            }
         } catch (...) {
+            if (chunk.masterFrom >= 0 && chunk.masterTo >= 0) {
+                if (chunk.masterTo - chunk.masterFrom <= 5) {
+                    throw;
+                }
+                const int midpoint = (chunk.masterFrom + chunk.masterTo) / 2;
+                ExportChunk left = chunk;
+                left.masterTo = midpoint;
+                left.expectedCount = -1;
+                ExportChunk right = chunk;
+                right.masterFrom = midpoint + 1;
+                right.expectedCount = -1;
+                emitLog(QString("%1: splitting MasterID range %2-%3 into smaller ranges.").arg(tableName).arg(chunk.masterFrom).arg(chunk.masterTo));
+                processChunk(left);
+                processChunk(right);
+                return;
+            }
             const QDate startDate = parseTallyDateValue(chunkFrom);
             const QDate endDate = parseTallyDateValue(chunkTo);
             if (!startDate.isValid() || !endDate.isValid() || startDate >= endDate) {
                 throw;
             }
             for (const auto &day : splitPeriod(startDate, endDate, "daily")) {
-                const QString xml = fetchXmlCached(url, buildRequest(company, day.first, day.second), company, tableName, day.first, day.second);
+                ExportChunk dayChunk{day.first, day.second, -1, -1, -1};
+                const QString xml = fetchXmlCached(url, buildRequest(company, day.first, day.second, -1, -1), company, tableName, dayChunk);
                 rows += parseChunk(parseXmlRoot(xml), day.first, day.second);
             }
         }
+    };
+    for (const auto &chunk : chunks) {
+        processChunk(chunk);
     }
+    emitLog(QString("%1: completed with %2 row(s).").arg(tableName).arg(rows.size()));
     return rows;
 }
 
@@ -642,13 +820,24 @@ QString buildLedgerRequestXml(const QString &company) {
     );
 }
 
-QString buildVoucherRequestXml(const QString &company, const QString &fromDate, const QString &toDate) {
+QPair<QString, QString> masterIdFilterXml(int masterFrom, int masterTo) {
+    if (masterFrom < 0 || masterTo < 0) {
+        return {"", ""};
+    }
+    return {
+        "<FILTER>MasterIdRange</FILTER>",
+        QString("<SYSTEM TYPE=\"Formulae\" NAME=\"MasterIdRange\">$MasterID &gt;= %1 AND $MasterID &lt;= %2</SYSTEM>").arg(masterFrom).arg(masterTo)
+    };
+}
+
+QString buildVoucherRequestXml(const QString &company, const QString &fromDate, const QString &toDate, int masterFrom, int masterTo) {
     QStringList staticVars = {"<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"};
     if (!company.isEmpty()) {
         staticVars << QString("<SVCURRENTCOMPANY>%1</SVCURRENTCOMPANY>").arg(escapeXml(company));
     }
     staticVars << QString("<SVFROMDATE TYPE='Date'>%1</SVFROMDATE>").arg(escapeXml(tallyRequestDate(fromDate)));
     staticVars << QString("<SVTODATE TYPE='Date'>%1</SVTODATE>").arg(escapeXml(tallyRequestDate(toDate)));
+    const auto filter = masterIdFilterXml(masterFrom, masterTo);
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
         "<TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER><BODY><DESC>"
@@ -661,12 +850,14 @@ QString buildVoucherRequestXml(const QString &company, const QString &fromDate, 
         "<COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
         "</OBJECT>"
         "<COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
+        + filter.first +
         "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, "
         "PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, "
         "AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, "
         "AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, "
         "AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
         "</COLLECTION>"
+        + filter.second +
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     );
 }
@@ -691,22 +882,25 @@ QString buildStockItemRequestXml(const QString &company) {
     );
 }
 
-QString buildInventoryEntriesRequestXml(const QString &company, const QString &fromDate, const QString &toDate) {
+QString buildInventoryEntriesRequestXml(const QString &company, const QString &fromDate, const QString &toDate, int masterFrom, int masterTo) {
     QStringList staticVars = {"<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"};
     if (!company.isEmpty()) {
         staticVars << QString("<SVCURRENTCOMPANY>%1</SVCURRENTCOMPANY>").arg(escapeXml(company));
     }
     staticVars << QString("<SVFROMDATE TYPE='Date'>%1</SVFROMDATE>").arg(escapeXml(tallyRequestDate(fromDate)));
     staticVars << QString("<SVTODATE TYPE='Date'>%1</SVTODATE>").arg(escapeXml(tallyRequestDate(toDate)));
+    const auto filter = masterIdFilterXml(masterFrom, masterTo);
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
         "<TYPE>COLLECTION</TYPE><ID>MyInventoryVouchers</ID></HEADER><BODY><DESC>"
         + QString("<STATICVARIABLES>%1</STATICVARIABLES>").arg(staticVars.join(""))
         + "<TDL><TDLMESSAGE>"
         "<COLLECTION NAME=\"MyInventoryVouchers\"><TYPE>Voucher</TYPE>"
+        + filter.first +
         "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, "
         "InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH>"
         "</COLLECTION>"
+        + filter.second +
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     );
 }
@@ -907,7 +1101,7 @@ QVector<QVariantMap> parseVouchers(const QDomDocument &doc, const QMap<QString, 
 
     for (int i = 0; i < nodes.size(); ++i) {
         const QDomElement voucher = nodes.at(i).toElement();
-        if (stripNs(voucher.tagName()).toUpper() != "VOUCHER") {
+        if (!isRealVoucher(voucher)) {
             continue;
         }
 
@@ -1036,7 +1230,7 @@ QVector<QVariantMap> parseInventoryEntries(const QDomDocument &doc, const QStrin
     QDomNodeList nodes = doc.elementsByTagName("VOUCHER");
     for (int i = 0; i < nodes.size(); ++i) {
         const QDomElement voucher = nodes.at(i).toElement();
-        if (stripNs(voucher.tagName()).toUpper() != "VOUCHER") {
+        if (!isRealVoucher(voucher)) {
             continue;
         }
 
@@ -1121,7 +1315,21 @@ TallyTable makeTable(const QString &id, const QString &title, const QString &fil
 }
 }
 
+void TallyService::resetCancellation() {
+    gCancelRequested.store(false);
+}
+
+void TallyService::cancelCurrentOperation() {
+    gCancelRequested.store(true);
+}
+
+void TallyService::setLogCallback(std::function<void(const QString &)> callback) {
+    std::lock_guard<std::mutex> lock(gLogMutex);
+    gLogCallback = std::move(callback);
+}
+
 CompanyInfo TallyService::getCompanyInfo(const QString &host, const QString &port) {
+    checkCancelled();
     const QString url = QString("http://%1:%2").arg(host, port);
     const QString activeCompanyXml =
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
@@ -1176,29 +1384,40 @@ CompanyInfo TallyService::getCompanyInfo(const QString &host, const QString &por
 
 TallyDataBundle TallyService::loadAllData(const QString &host, const QString &port, const QString &company,
                                           const QString &fromDate, const QString &toDate) {
+    checkCancelled();
     const QString url = QString("http://%1:%2").arg(host, port);
     QString selectedCompany = cleanText(company);
     QString selectedFrom = cleanText(fromDate);
     QString selectedTo = cleanText(toDate);
+    emitLog(QString("Load started. Target: %1.").arg(url));
 
     if (selectedCompany.isEmpty() || selectedFrom.isEmpty() || selectedTo.isEmpty()) {
+        emitLog("Company/date input incomplete; requesting active company metadata.");
         const CompanyInfo info = getCompanyInfo(host, port);
         if (selectedCompany.isEmpty()) selectedCompany = info.name;
         if (selectedFrom.isEmpty()) selectedFrom = info.startDateRaw;
         if (selectedTo.isEmpty()) selectedTo = info.endDateRaw;
+        emitLog(QString("Company metadata received: company='%1', starting='%2', ending='%3'.")
+                    .arg(info.name, formatTallyDate(info.startDateRaw), formatTallyDate(info.endDateRaw)));
     }
+    emitLog(QString("Using company='%1', period=%2 to %3.").arg(selectedCompany, formatTallyDate(selectedFrom), formatTallyDate(selectedTo)));
 
+    emitLog("Fetching voucher type and group metadata.");
     const auto metadata = fetchTallyMetadata(url, selectedCompany);
     const QMap<QString, QString> &vtypeMap = metadata.first;
     const QMap<QString, GroupInfo> &groupMap = metadata.second;
+    emitLog(QString("Metadata received. Voucher types: %1. Groups: %2.").arg(vtypeMap.size()).arg(groupMap.size()));
 
+    emitLog("Fetching ledgers.");
     const QDomDocument ledgerDoc = parseXmlRoot(postToTally(url, buildLedgerRequestXml(selectedCompany)));
     const QVector<QVariantMap> ledgerRows = parseLedgers(ledgerDoc, groupMap);
     QMap<QString, QVariantMap> ledgerMeta;
     for (const QVariantMap &row : ledgerRows) {
         ledgerMeta.insert(row.value("Name").toString(), row);
     }
+    emitLog(QString("Ledgers parsed. Rows: %1.").arg(ledgerRows.size()));
 
+    emitLog("Fetching accounting/all voucher rows with probe-based chunking.");
     const QVector<QVariantMap> allVoucherRows = fetchChunkedRows(
         url,
         selectedCompany,
@@ -1216,9 +1435,12 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
         }
     }
 
+    emitLog("Fetching stock items.");
     const QDomDocument stockDoc = parseXmlRoot(postToTally(url, buildStockItemRequestXml(selectedCompany)));
     const QVector<QVariantMap> stockRows = parseStockItems(stockDoc);
+    emitLog(QString("Stock items parsed. Rows: %1.").arg(stockRows.size()));
 
+    emitLog("Fetching stock voucher rows with probe-based chunking.");
     const QVector<QVariantMap> inventoryRows = fetchChunkedRows(
         url,
         selectedCompany,
@@ -1239,5 +1461,12 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
     bundle.tables.insert("ledger_df", makeTable("ledger_df", "Ledgers", "ledgers.csv", kLedgerColumns, ledgerRows, selectedCompany, selectedFrom, selectedTo));
     bundle.tables.insert("stock_item_df", makeTable("stock_item_df", "Stock Items", "stock_items.csv", kStockItemColumns, stockRows, selectedCompany, selectedFrom, selectedTo));
     bundle.tables.insert("inventory_df", makeTable("inventory_df", "Stock Vouchers", "stock_vouchers.csv", kStockVoucherColumns, inventoryRows, selectedCompany, selectedFrom, selectedTo));
+    emitLog(
+        QString("Load completed. Accounting voucher rows: %1. All voucher rows: %2. Ledgers: %3. Stock items: %4. Stock vouchers: %5.")
+            .arg(voucherRows.size())
+            .arg(allVoucherRows.size())
+            .arg(ledgerRows.size())
+            .arg(stockRows.size())
+            .arg(inventoryRows.size()));
     return bundle;
 }

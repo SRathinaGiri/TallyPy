@@ -5,6 +5,7 @@
 #include <QStringList>
 #include <QVariantMap>
 #include <QVector>
+#include <functional>
 
 struct TallyTable {
     QString id;
@@ -29,6 +30,9 @@ struct TallyDataBundle {
 
 class TallyService {
 public:
+    static void resetCancellation();
+    static void cancelCurrentOperation();
+    static void setLogCallback(std::function<void(const QString &)> callback);
     static CompanyInfo getCompanyInfo(const QString &host, const QString &port);
     static TallyDataBundle loadAllData(const QString &host, const QString &port, const QString &company,
                                        const QString &fromDate, const QString &toDate);

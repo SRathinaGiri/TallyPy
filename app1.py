@@ -429,6 +429,50 @@ def split_period(start_date, end_date, mode):
     return chunks
 
 
+def is_real_voucher(elem):
+    if strip_ns(elem.tag).upper() != "VOUCHER":
+        return False
+    if elem.get("VCHKEY") or elem.get("REMOTEID") or elem.get("VCHTYPE"):
+        return True
+    return bool(
+        direct_child_text(elem, "DATE")
+        or direct_child_text(elem, "VOUCHERTYPENAME")
+        or direct_child_text(elem, "VOUCHERNUMBER")
+        or direct_child_text(elem, "MASTERID")
+    )
+
+
+def voucher_master_id(voucher):
+    text = clean_text(voucher.get("MASTERID")) or direct_child_text(voucher, "MASTERID")
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def make_chunk(from_date, to_date, master_from=None, master_to=None, expected_count=None):
+    return {
+        "from_date": clean_text(from_date),
+        "to_date": clean_text(to_date),
+        "master_from": master_from,
+        "master_to": master_to,
+        "expected_count": expected_count,
+    }
+
+
+def masterid_filter_xml(master_from=None, master_to=None):
+    if master_from is None or master_to is None:
+        return "", ""
+    try:
+        master_from = int(master_from)
+        master_to = int(master_to)
+    except (TypeError, ValueError):
+        return "", ""
+    collection_filter = "<FILTER>MasterIdRange</FILTER>"
+    formula = f"<SYSTEM TYPE=\"Formulae\" NAME=\"MasterIdRange\">$MasterID &gt;= {master_from} AND $MasterID &lt;= {master_to}</SYSTEM>"
+    return collection_filter, formula
+
+
 def build_voucher_probe_request_xml(company, from_date, to_date):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
@@ -447,47 +491,65 @@ def build_voucher_probe_request_xml(company, from_date, to_date):
     )
 
 
-def probe_voucher_count(url, company, from_date, to_date):
+def probe_vouchers(url, company, from_date, to_date):
     root = parse_xml_root(post_to_tally(url, build_voucher_probe_request_xml(company, from_date, to_date), timeout=180))
     counts_by_month = {}
+    counts_by_day = {}
+    entries = []
     total = 0
     for voucher in root.iter():
-        if strip_ns(voucher.tag).upper() != "VOUCHER":
+        if not is_real_voucher(voucher):
             continue
         total += 1
         voucher_date = parse_tally_date_value(direct_child_text(voucher, "DATE"))
+        master_id = voucher_master_id(voucher)
         if voucher_date:
             key = (voucher_date.year, voucher_date.month)
             counts_by_month[key] = counts_by_month.get(key, 0) + 1
-    return total, counts_by_month
+            counts_by_day[voucher_date.strftime("%Y%m%d")] = counts_by_day.get(voucher_date.strftime("%Y%m%d"), 0) + 1
+            if master_id is not None:
+                entries.append((voucher_date, master_id))
+    return total, counts_by_month, counts_by_day, entries
+
+
+def build_masterid_chunks(entries, start_date, end_date, max_vouchers=1000):
+    master_ids = sorted(master_id for _, master_id in entries if master_id is not None)
+    chunks = []
+    for index in range(0, len(master_ids), max_vouchers):
+        batch = master_ids[index:index + max_vouchers]
+        chunks.append(make_chunk(start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), min(batch), max(batch), len(batch)))
+    return chunks
 
 
 def plan_export_chunks(url, company, from_date, to_date):
     start_date = parse_tally_date_value(from_date)
     end_date = parse_tally_date_value(to_date)
     if not start_date or not end_date or start_date > end_date:
-        return [(clean_text(from_date), clean_text(to_date))]
+        return [make_chunk(from_date, to_date)]
     try:
-        total, counts_by_month = probe_voucher_count(url, company, from_date, to_date)
-        if total <= 2000:
-            return [(tally_request_date(from_date), tally_request_date(to_date))]
+        total, counts_by_month, counts_by_day, entries = probe_vouchers(url, company, from_date, to_date)
+        target = max(250, int(os.environ.get("TALLYXML_CHUNK_VOUCHERS", "1000") or "1000"))
+        if total <= target:
+            return [make_chunk(tally_request_date(from_date), tally_request_date(to_date), expected_count=total)]
+        if entries:
+            return build_masterid_chunks(entries, start_date, end_date, max_vouchers=target)
         mode = "monthly" if max(counts_by_month.values() or [0]) <= 2000 else "weekly"
     except Exception:
         mode = "monthly"
-    return [(start.strftime("%Y%m%d"), end.strftime("%Y%m%d")) for start, end in split_period(start_date, end_date, mode)]
+    return [make_chunk(start.strftime("%Y%m%d"), end.strftime("%Y%m%d")) for start, end in split_period(start_date, end_date, mode)]
 
 
-def cache_file_path(company, table_name, from_date, to_date):
+def cache_file_path(company, table_name, from_date, to_date, master_from=None, master_to=None):
     cache_root = os.path.join(os.getcwd(), ".tally_cache")
-    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), "xml-v2"])
+    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), clean_text(master_from), clean_text(master_to), "xml-v5"])
     file_name = hashlib.sha1(key_text.encode("utf-8", errors="ignore")).hexdigest() + ".xml"
     return os.path.join(cache_root, file_name)
 
 
-def fetch_xml_cached(url, xml_text, company, table_name, from_date, to_date):
+def fetch_xml_cached(url, xml_text, company, table_name, chunk):
     if os.environ.get("TALLYXML_DISABLE_CACHE") == "1":
         return post_to_tally(url, xml_text)
-    path = cache_file_path(company, table_name, from_date, to_date)
+    path = cache_file_path(company, table_name, chunk["from_date"], chunk["to_date"], chunk.get("master_from"), chunk.get("master_to"))
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -513,26 +575,58 @@ def fetch_xml_cached(url, xml_text, company, table_name, from_date, to_date):
 
 def fetch_chunked_rows(url, company, from_date, to_date, table_name, build_request, parse_chunk):
     rows = []
-    for chunk_from, chunk_to in plan_export_chunks(url, company, from_date, to_date):
+    def process_chunk(chunk):
+        chunk_from = chunk["from_date"]
+        chunk_to = chunk["to_date"]
         try:
-            xml = fetch_xml_cached(url, build_request(company, chunk_from, chunk_to), company, table_name, chunk_from, chunk_to)
+            xml = fetch_xml_cached(
+                url,
+                build_request(company, chunk_from, chunk_to, chunk.get("master_from"), chunk.get("master_to")),
+                company,
+                table_name,
+                chunk,
+            )
             root = parse_xml_root(xml)
             status = clean_text(first_descendant_text(root, "STATUS"))
             if status == "0":
                 error_text = first_descendant_text(root, "LINEERROR") or "Tally returned STATUS=0"
                 raise ValueError(error_text)
+            if chunk.get("master_from") is not None and chunk.get("expected_count") is not None:
+                detail_count = sum(1 for elem in root.iter() if is_real_voucher(elem))
+                if detail_count < chunk["expected_count"]:
+                    raise ValueError(f"MasterID-filtered response returned {detail_count} voucher header(s), expected {chunk['expected_count']}.")
             rows.extend(parse_chunk(root, chunk_from, chunk_to))
         except Exception:
+            master_from = chunk.get("master_from")
+            master_to = chunk.get("master_to")
+            if master_from is not None and master_to is not None:
+                master_from = int(master_from)
+                master_to = int(master_to)
+                if master_to - master_from <= 5:
+                    raise
+                midpoint = (master_from + master_to) // 2
+                left = dict(chunk)
+                left["master_to"] = midpoint
+                left["expected_count"] = None
+                right = dict(chunk)
+                right["master_from"] = midpoint + 1
+                right["expected_count"] = None
+                process_chunk(left)
+                process_chunk(right)
+                return
             start_date = parse_tally_date_value(chunk_from)
             end_date = parse_tally_date_value(chunk_to)
             if start_date and end_date and start_date < end_date:
                 for day_start, day_end in split_period(start_date, end_date, "daily"):
                     day_from = day_start.strftime("%Y%m%d")
                     day_to = day_end.strftime("%Y%m%d")
-                    xml = fetch_xml_cached(url, build_request(company, day_from, day_to), company, table_name, day_from, day_to)
+                    day_chunk = make_chunk(day_from, day_to)
+                    xml = fetch_xml_cached(url, build_request(company, day_from, day_to, None, None), company, table_name, day_chunk)
                     rows.extend(parse_chunk(parse_xml_root(xml), day_from, day_to))
             else:
                 raise
+    for chunk in plan_export_chunks(url, company, from_date, to_date):
+        process_chunk(chunk)
     return rows
 
 
@@ -578,12 +672,13 @@ def build_ledger_request_xml(company):
     )
 
 
-def build_voucher_request_xml(company, from_date, to_date):
+def build_voucher_request_xml(company, from_date, to_date, master_from=None, master_to=None):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
-    static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(from_date)}</SVFROMDATE>")
-    static_vars.append(f"<SVTODATE TYPE='Date'>{escape(to_date)}</SVTODATE>")
+    static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE>")
+    static_vars.append(f"<SVTODATE TYPE='Date'>{escape(tally_request_date(to_date))}</SVTODATE>")
+    collection_filter, filter_formula = masterid_filter_xml(master_from, master_to)
 
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
@@ -597,12 +692,14 @@ def build_voucher_request_xml(company, from_date, to_date):
         "<COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
         "</OBJECT>"
         "<COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
+        f"{collection_filter}"
         "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, "
         "PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, "
         "AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, "
         "AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, "
         "AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
         "</COLLECTION>"
+        f"{filter_formula}"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
 
@@ -627,12 +724,13 @@ def build_stock_item_request_xml(company):
     )
 
 
-def build_inventory_entries_request_xml(company, from_date, to_date):
+def build_inventory_entries_request_xml(company, from_date, to_date, master_from=None, master_to=None):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
-    static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(from_date)}</SVFROMDATE>")
-    static_vars.append(f"<SVTODATE TYPE='Date'>{escape(to_date)}</SVTODATE>")
+    static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE>")
+    static_vars.append(f"<SVTODATE TYPE='Date'>{escape(tally_request_date(to_date))}</SVTODATE>")
+    collection_filter, filter_formula = masterid_filter_xml(master_from, master_to)
 
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
@@ -640,9 +738,11 @@ def build_inventory_entries_request_xml(company, from_date, to_date):
         f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
         "<COLLECTION NAME=\"MyInventoryVouchers\"><TYPE>Voucher</TYPE>"
+        f"{collection_filter}"
         "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, "
         "InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH>"
         "</COLLECTION>"
+        f"{filter_formula}"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
 
@@ -730,7 +830,7 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=Non
         vtype_map = {}
 
     for voucher in root.iter():
-        if strip_ns(voucher.tag).upper() != "VOUCHER":
+        if not is_real_voucher(voucher):
             continue
 
         voucher_type = canonical_voucher_type_name(direct_child_text(voucher, "VOUCHERTYPENAME"))
@@ -845,7 +945,7 @@ def parse_stock_items(root):
 def parse_inventory_entries(root, company):
     rows = []
     for voucher in root.iter():
-        if strip_ns(voucher.tag).upper() != "VOUCHER":
+        if not is_real_voucher(voucher):
             continue
         v_type = direct_child_text(voucher, "VOUCHERTYPENAME")
         if "Order" in v_type:

@@ -2,9 +2,11 @@ import calendar
 import hashlib
 import os
 import re
+import shutil
 import threading
 import time
 import tkinter as tk
+import traceback
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -375,13 +377,43 @@ def ledger_primary_group(ledger_name, ledger_meta):
     return ""
 
 
-def post_to_tally(url, xml_text, timeout=120):
-    response = requests.post(
+class ExportCancelled(Exception):
+    pass
+
+
+class IncompleteChunkError(Exception):
+    pass
+
+
+class ExportRunContext:
+    def __init__(self):
+        self.cancel_event = threading.Event()
+        self.session = requests.Session()
+
+    def cancel(self):
+        self.cancel_event.set()
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def check_cancelled(self):
+        if self.cancel_event.is_set():
+            raise ExportCancelled("Operation cancelled by user.")
+
+
+def post_to_tally(url, xml_text, timeout=120, context=None):
+    if context:
+        context.check_cancelled()
+    client = context.session if context else requests
+    response = client.post(
         url,
         data=xml_text.encode("utf-8"),
         headers={"Content-Type": "text/xml; charset=utf-8"},
         timeout=timeout,
     )
+    if context:
+        context.check_cancelled()
     response.raise_for_status()
     encoding = response.encoding or "utf-8"
     return response.content.decode(encoding, errors="replace")
@@ -423,65 +455,488 @@ def split_period(start_date, end_date, mode):
     return chunks
 
 
+def voucher_master_id(voucher):
+    text = clean_text(voucher.get("MASTERID")) or direct_child_text(voucher, "MASTERID")
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def chunk_label(chunk):
+    label = f"{format_tally_date(chunk['from_date'])} to {format_tally_date(chunk['to_date'])}"
+    if chunk.get("master_from") is not None and chunk.get("master_to") is not None:
+        label += f", MasterID {chunk['master_from']}-{chunk['master_to']}"
+    if chunk.get("expected_count") is not None:
+        label += f", expected vouchers {chunk['expected_count']}"
+    return label
+
+
+def make_date_chunk(from_date, to_date, expected_count=None):
+    return {
+        "from_date": clean_text(from_date),
+        "to_date": clean_text(to_date),
+        "master_from": None,
+        "master_to": None,
+        "expected_count": expected_count,
+    }
+
+
+def create_voucher_diagnostics():
+    return {
+        "headers": {},
+        "type_counts": {},
+        "category_counts": {},
+        "zero_export_reasons": {},
+    }
+
+
+def voucher_header_key(voucher, voucher_date, voucher_type, voucher_number):
+    master_id = clean_text(voucher.get("MASTERID")) or direct_child_text(voucher, "MASTERID")
+    if master_id:
+        return f"master:{master_id}"
+    return "|".join(["fallback", voucher_date, voucher_type, voucher_number, clean_text(voucher.get("VCHKEY"))])
+
+
+def record_voucher_diagnostic(diag, key, voucher_type, category, export_rows, reason):
+    if diag is None:
+        return
+    is_new = key not in diag["headers"]
+    header = diag["headers"].setdefault(key, {
+        "voucher_type": voucher_type or "Unknown",
+        "category": category or "Unknown",
+        "rows": 0,
+        "reason": "",
+    })
+    header["rows"] += export_rows
+    if not header["reason"] and reason:
+        header["reason"] = reason
+    if is_new:
+        diag["type_counts"][header["voucher_type"]] = diag["type_counts"].get(header["voucher_type"], 0) + 1
+        diag["category_counts"][header["category"]] = diag["category_counts"].get(header["category"], 0) + 1
+
+
+def finalize_voucher_diagnostics(diag):
+    if not diag:
+        return {}
+    headers = list(diag["headers"].values())
+    headers_with_rows = sum(1 for item in headers if item["rows"] > 0)
+    headers_without_rows = len(headers) - headers_with_rows
+    reason_counts = {}
+    for item in headers:
+        if item["rows"] == 0:
+            reason = item.get("reason") or "No exported ledger rows"
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return {
+        "header_count": len(headers),
+        "headers_with_rows": headers_with_rows,
+        "headers_without_rows": headers_without_rows,
+        "type_counts": dict(sorted(diag["type_counts"].items(), key=lambda item: (-item[1], item[0]))),
+        "category_counts": dict(sorted(diag["category_counts"].items(), key=lambda item: (-item[1], item[0]))),
+        "reason_counts": dict(sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))),
+    }
+
+
+def format_top_counts(counts, limit=8):
+    if not counts:
+        return "none"
+    items = list(counts.items())[:limit]
+    text = ", ".join(f"{name}: {count}" for name, count in items)
+    if len(counts) > limit:
+        text += ", ..."
+    return text
+
+
+def verbose_chunk_logging():
+    return os.environ.get("TALLYXML_VERBOSE_CHUNKS") == "1"
+
+
+def should_log_chunk_detail(display_name):
+    if verbose_chunk_logging():
+        return True
+    match = re.search(r"chunk\s+(\d+)/(\d+)", display_name)
+    if not match:
+        return False
+    index = int(match.group(1))
+    total = int(match.group(2))
+    if total <= 20:
+        return True
+    return index <= 5 or index == total or index % 50 == 0
+
+
+def dataframe_value_counts(df, column):
+    if df.empty or column not in df.columns:
+        return {}
+    counts = df[column].fillna("").replace("", "Blank").value_counts()
+    return {str(key): int(value) for key, value in counts.items()}
+
+
+def is_real_voucher(elem):
+    if strip_ns(elem.tag).upper() != "VOUCHER":
+        return False
+    if elem.get("VCHKEY") or elem.get("REMOTEID") or elem.get("VCHTYPE"):
+        return True
+    return bool(
+        direct_child_text(elem, "DATE")
+        or direct_child_text(elem, "VOUCHERTYPENAME")
+        or direct_child_text(elem, "VOUCHERNUMBER")
+        or direct_child_text(elem, "MASTERID")
+    )
+
+
+def count_voucher_headers(root):
+    return sum(1 for elem in root.iter() if is_real_voucher(elem))
+
+
+def tally_formula_date(value):
+    parsed = parse_tally_date_value(value)
+    if not parsed:
+        return format_tally_date(value)
+    return f"{parsed.day}-{calendar.month_abbr[parsed.month]}-{parsed.year}"
+
+
+def collection_filter_xml(from_date, to_date, master_from=None, master_to=None):
+    filters = []
+    formulas = []
+    if master_from is not None and master_to is not None:
+        try:
+            master_from = int(master_from)
+            master_to = int(master_to)
+        except (TypeError, ValueError):
+            master_from = None
+            master_to = None
+        if master_from is not None and master_to is not None:
+            filters.append("<FILTER>MasterIdRange</FILTER>")
+            formulas.append(
+                "<SYSTEM TYPE=\"Formulae\" NAME=\"MasterIdRange\">"
+                f"$MasterID &gt;= {master_from} AND $MasterID &lt;= {master_to}"
+                "</SYSTEM>"
+            )
+    else:
+        filters.append("<FILTER>DateRange</FILTER>")
+        formulas.append(
+            "<SYSTEM TYPE=\"Formulae\" NAME=\"DateRange\">"
+            f"$Date &gt;= $$Date:\"{escape(tally_formula_date(from_date))}\" "
+            f"AND $Date &lt;= $$Date:\"{escape(tally_formula_date(to_date))}\""
+            "</SYSTEM>"
+        )
+    return "".join(filters), "".join(formulas)
+
+
 def build_voucher_probe_request_xml(company, from_date, to_date):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
     static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE>")
     static_vars.append(f"<SVTODATE TYPE='Date'>{escape(tally_request_date(to_date))}</SVTODATE>")
+    collection_filter, filter_formula = collection_filter_xml(from_date, to_date)
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
         "<TYPE>COLLECTION</TYPE><ID>MyVoucherProbe</ID></HEADER><BODY><DESC>"
         f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
         "<TDL><TDLMESSAGE><COLLECTION NAME=\"MyVoucherProbe\"><TYPE>Voucher</TYPE>"
+        f"{collection_filter}"
         "<FETCH>Date, MasterID, VoucherTypeName</FETCH>"
-        "</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+        "</COLLECTION>"
+        f"{filter_formula}"
+        "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
 
 
-def probe_voucher_count(url, company, from_date, to_date):
-    root = parse_xml_root(post_to_tally(url, build_voucher_probe_request_xml(company, from_date, to_date), timeout=180))
+def build_data_exception_report_xml(company, report_id):
+    static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
+    if company:
+        static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
+    return (
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
+        f"<TYPE>DATA</TYPE><ID>{escape(report_id)}</ID></HEADER><BODY><DESC>"
+        f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
+        "</DESC></BODY></ENVELOPE>"
+    )
+
+
+def check_tally_data_exceptions(url, company, log=None, context=None):
+    report_ids = [
+        "Data Exceptions",
+        "All Exceptions",
+        "Repair/Migrate Exceptions",
+        "Import Exceptions",
+        "Synchronisation Exceptions",
+    ]
+    exception_markers = (
+        "voucher-related exceptions",
+        "master-related exceptions",
+        "repair/migrate exceptions",
+        "import exceptions",
+        "synchronisation exceptions",
+        "data exceptions exist",
+    )
+    unsupported_markers = (
+        "could not find",
+        "unknown report",
+        "invalid report",
+        "lineerror",
+        "does not exist",
+    )
+    for report_id in report_ids:
+        try:
+            if context:
+                context.check_cancelled()
+            xml = post_to_tally(url, build_data_exception_report_xml(company, report_id), timeout=20, context=context)
+        except ExportCancelled:
+            raise
+        except Exception as exc:
+            if log:
+                log(f"Data exception preflight: report '{report_id}' not available or timed out: {exc}")
+            continue
+        plain_text = clean_text(re.sub(r"<[^>]+>", " ", xml_cleanup(xml)))
+        lowered = plain_text.lower()
+        if any(marker in lowered for marker in unsupported_markers):
+            if log:
+                log(f"Data exception preflight: report '{report_id}' did not return usable exception data.")
+            continue
+        if any(marker in lowered for marker in exception_markers) and re.search(r"\b[1-9]\d*\b", lowered):
+            summary = plain_text[:500] + ("..." if len(plain_text) > 500 else "")
+            if log:
+                log(f"Data exception preflight: possible exceptions found in '{report_id}': {summary}")
+            return report_id, summary
+        if log:
+            log(f"Data exception preflight: report '{report_id}' returned no obvious exception markers.")
+    return None, ""
+
+
+def probe_vouchers(url, company, from_date, to_date, log=None, context=None):
+    if log:
+        log(f"Probe started for {format_tally_date(from_date)} to {format_tally_date(to_date)}")
+    started = time.perf_counter()
+    root = parse_xml_root(post_to_tally(url, build_voucher_probe_request_xml(company, from_date, to_date), timeout=180, context=context))
     counts_by_month = {}
+    counts_by_day = {}
+    entries = []
     total = 0
     for voucher in root.iter():
-        if strip_ns(voucher.tag).upper() != "VOUCHER":
+        if context:
+            context.check_cancelled()
+        if not is_real_voucher(voucher):
             continue
         total += 1
         voucher_date = parse_tally_date_value(direct_child_text(voucher, "DATE"))
+        master_id = voucher_master_id(voucher)
         if voucher_date:
             key = (voucher_date.year, voucher_date.month)
             counts_by_month[key] = counts_by_month.get(key, 0) + 1
-    return total, counts_by_month
+            day_key = voucher_date.strftime("%Y%m%d")
+            counts_by_day[day_key] = counts_by_day.get(day_key, 0) + 1
+            if master_id is not None:
+                entries.append((voucher_date, master_id))
+    if log:
+        elapsed = time.perf_counter() - started
+        month_text = ", ".join(f"{year}-{month:02d}: {count}" for (year, month), count in sorted(counts_by_month.items()))
+        peak_day = max(counts_by_day.items(), key=lambda item: item[1], default=None)
+        peak_text = f"{format_tally_date(peak_day[0])}: {peak_day[1]}" if peak_day else "none"
+        log(f"Probe completed in {elapsed:.1f}s. Voucher headers found: {total}. MasterIDs found: {len(entries)}. Peak day: {peak_text}. Monthly counts: {month_text or 'none'}")
+    return total, counts_by_month, counts_by_day, entries
 
 
-def plan_export_chunks(url, company, from_date, to_date):
+def build_masterid_chunks(entries, start_date, end_date, max_vouchers=1000):
+    if not entries:
+        return []
+    chunks = []
+    master_ids = sorted(master_id for _, master_id in entries if master_id is not None)
+    for index in range(0, len(master_ids), max_vouchers):
+        batch = master_ids[index:index + max_vouchers]
+        chunks.append({
+            "from_date": start_date.strftime("%Y%m%d"),
+            "to_date": end_date.strftime("%Y%m%d"),
+            "master_from": min(batch),
+            "master_to": max(batch),
+            "expected_count": len(batch),
+        })
+    return chunks
+
+
+def build_count_date_chunks(counts_by_day, start_date, end_date, max_vouchers=1000):
+    chunks = []
+    current_start = None
+    current_end = None
+    current_count = 0
+
+    for day_text in sorted(counts_by_day):
+        day = parse_tally_date_value(day_text)
+        if not day:
+            continue
+        day_count = counts_by_day.get(day_text, 0)
+        if current_start is None:
+            current_start = day
+            current_end = day
+            current_count = day_count
+            continue
+        if current_count and current_count + day_count > max_vouchers:
+            chunks.append(make_date_chunk(current_start.strftime("%Y%m%d"), current_end.strftime("%Y%m%d"), current_count))
+            current_start = day
+            current_end = day
+            current_count = day_count
+        else:
+            current_end = day
+            current_count += day_count
+
+    if current_start is not None:
+        chunks.append(make_date_chunk(current_start.strftime("%Y%m%d"), current_end.strftime("%Y%m%d"), current_count))
+
+    if not chunks:
+        return [make_date_chunk(start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), 0)]
+
+    first_day = parse_tally_date_value(chunks[0]["from_date"])
+    last_day = parse_tally_date_value(chunks[-1]["to_date"])
+    if first_day and first_day > start_date:
+        chunks.insert(0, make_date_chunk(start_date.strftime("%Y%m%d"), (first_day - timedelta(days=1)).strftime("%Y%m%d"), 0))
+    if last_day and last_day < end_date:
+        chunks.append(make_date_chunk((last_day + timedelta(days=1)).strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), 0))
+    return chunks
+
+
+def probe_summary_from_counts(total, counts_by_day, entries):
+    if not counts_by_day:
+        return {
+            "total": total,
+            "master_count": len(entries),
+            "first_voucher_date": "",
+            "last_voucher_date": "",
+            "peak_day": "",
+            "peak_day_count": 0,
+        }
+    days = sorted(counts_by_day)
+    peak_day, peak_count = max(counts_by_day.items(), key=lambda item: item[1])
+    return {
+        "total": total,
+        "master_count": len(entries),
+        "first_voucher_date": days[0],
+        "last_voucher_date": days[-1],
+        "peak_day": peak_day,
+        "peak_day_count": peak_count,
+    }
+
+
+def probe_coverage_warning(from_date, to_date, summary):
+    requested_from = parse_tally_date_value(from_date)
+    requested_to = parse_tally_date_value(to_date)
+    first_voucher = parse_tally_date_value(summary.get("first_voucher_date"))
+    last_voucher = parse_tally_date_value(summary.get("last_voucher_date"))
+    if not requested_from or not requested_to or summary.get("total", 0) == 0:
+        return ""
+    warnings = []
+    if first_voucher and first_voucher > requested_from + timedelta(days=31):
+        warnings.append(f"first voucher returned is {first_voucher.isoformat()}, much later than requested from-date {requested_from.isoformat()}")
+    if last_voucher and last_voucher < requested_to - timedelta(days=31):
+        warnings.append(f"last voucher returned is {last_voucher.isoformat()}, much earlier than requested to-date {requested_to.isoformat()}")
+    missing_master_ids = summary.get("total", 0) - summary.get("master_count", 0)
+    if missing_master_ids > max(10, int(summary.get("total", 0) * 0.01)):
+        warnings.append(f"probe found {summary['total']} voucher headers but {missing_master_ids} did not expose MasterID")
+    if not warnings:
+        return ""
+    return "Potential incomplete voucher coverage from Tally: " + "; ".join(warnings) + ". Check active company, selected period, data exceptions, and rewrite/repair status."
+
+
+def plan_export_chunks(url, company, from_date, to_date, log=None, context=None, warnings=None):
     start_date = parse_tally_date_value(from_date)
     end_date = parse_tally_date_value(to_date)
     if not start_date or not end_date or start_date > end_date:
-        return [(clean_text(from_date), clean_text(to_date))]
+        if log:
+            log("Could not parse date range for chunk planning; using one request.")
+        return [make_date_chunk(from_date, to_date)]
     try:
-        total, counts_by_month = probe_voucher_count(url, company, from_date, to_date)
-        if total <= 2000:
-            return [(tally_request_date(from_date), tally_request_date(to_date))]
-        mode = "monthly" if max(counts_by_month.values() or [0]) <= 2000 else "weekly"
-    except Exception:
+        total, counts_by_month, counts_by_day, entries = probe_vouchers(url, company, from_date, to_date, log, context)
+        summary = probe_summary_from_counts(total, counts_by_day, entries)
+        warning = probe_coverage_warning(from_date, to_date, summary)
+        if warning:
+            if warnings is not None:
+                warnings.append(warning)
+            if log:
+                log(f"WARNING: {warning}")
+        target_vouchers_per_chunk = int(os.environ.get("TALLYXML_CHUNK_VOUCHERS", "1000") or "1000")
+        target_vouchers_per_chunk = max(250, target_vouchers_per_chunk)
+        if total <= target_vouchers_per_chunk:
+            chunks = [make_date_chunk(tally_request_date(from_date), tally_request_date(to_date), total)]
+            if log:
+                log(f"Chunk plan: one full-period request because probe count is <= {target_vouchers_per_chunk}.")
+            return chunks
+        if entries:
+            chunks = build_masterid_chunks(entries, start_date, end_date, max_vouchers=target_vouchers_per_chunk)
+            if log:
+                first_chunk = chunk_label(chunks[0]) if chunks else "none"
+                last_chunk = chunk_label(chunks[-1]) if chunks else "none"
+                max_chunk_count = max((chunk.get("expected_count") or 0) for chunk in chunks) if chunks else 0
+                log(
+                    f"Chunk plan: {len(chunks)} MasterID chunk(s), target <= {target_vouchers_per_chunk} "
+                    f"probed vouchers each, max planned {max_chunk_count}. First: {first_chunk}. Last: {last_chunk}."
+                )
+            return chunks
+        if counts_by_day:
+            chunks = build_count_date_chunks(counts_by_day, start_date, end_date, max_vouchers=target_vouchers_per_chunk)
+            if log:
+                first_chunk = chunk_label(chunks[0]) if chunks else "none"
+                last_chunk = chunk_label(chunks[-1]) if chunks else "none"
+                max_chunk_count = max((chunk.get("expected_count") or 0) for chunk in chunks) if chunks else 0
+                log(
+                    f"Chunk plan: {len(chunks)} date-range chunk(s), target <= {target_vouchers_per_chunk} "
+                    f"probed vouchers each, max planned {max_chunk_count}. First: {first_chunk}. Last: {last_chunk}."
+                )
+            return chunks
+        max_month = max(counts_by_month.values() or [0])
+        mode = "monthly" if max_month <= 2000 else "weekly"
+    except Exception as exc:
         mode = "monthly"
-    return [(start.strftime("%Y%m%d"), end.strftime("%Y%m%d")) for start, end in split_period(start_date, end_date, mode)]
+        if log:
+            log(f"Probe failed: {exc}. Falling back to monthly chunks.")
+    chunks = [make_date_chunk(start.strftime("%Y%m%d"), end.strftime("%Y%m%d")) for start, end in split_period(start_date, end_date, mode)]
+    if log:
+        first_chunk = chunk_label(chunks[0]) if chunks else "none"
+        last_chunk = chunk_label(chunks[-1]) if chunks else "none"
+        log(f"Chunk plan: {len(chunks)} {mode} chunk(s). First: {first_chunk}. Last: {last_chunk}.")
+    return chunks
 
 
-def cache_file_path(company, table_name, from_date, to_date):
+def cache_file_path(company, table_name, from_date, to_date, master_from=None, master_to=None):
     cache_root = os.path.join(os.getcwd(), ".tally_cache")
-    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), "xml-v2"])
+    key_text = "|".join([
+        clean_text(company),
+        table_name,
+        clean_text(from_date),
+        clean_text(to_date),
+        clean_text(master_from),
+        clean_text(master_to),
+        "xml-v5",
+    ])
     file_name = hashlib.sha1(key_text.encode("utf-8", errors="ignore")).hexdigest() + ".xml"
     return os.path.join(cache_root, file_name)
 
 
-def fetch_xml_cached(url, xml_text, company, table_name, from_date, to_date):
-    if os.environ.get("TALLYXML_DISABLE_CACHE") == "1":
-        return post_to_tally(url, xml_text)
-    path = cache_file_path(company, table_name, from_date, to_date)
+def remove_cached_chunk(company, table_name, chunk):
+    path = cache_file_path(company, table_name, chunk["from_date"], chunk["to_date"], chunk.get("master_from"), chunk.get("master_to"))
     try:
         if os.path.exists(path):
+            os.remove(path)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def fetch_xml_cached(url, xml_text, company, table_name, chunk, log=None, context=None):
+    label = chunk_label(chunk)
+    verbose = verbose_chunk_logging()
+    if context:
+        context.check_cancelled()
+    if os.environ.get("TALLYXML_DISABLE_CACHE") == "1":
+        if log and verbose:
+            log(f"{table_name} {label}: cache disabled; requesting Tally.")
+        return post_to_tally(url, xml_text, context=context)
+    path = cache_file_path(company, table_name, chunk["from_date"], chunk["to_date"], chunk.get("master_from"), chunk.get("master_to"))
+    try:
+        if os.path.exists(path):
+            if log and verbose:
+                size_kb = os.path.getsize(path) / 1024
+                log(f"{table_name} {label}: cache hit ({size_kb:.1f} KB).")
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
                 return handle.read()
     except OSError:
@@ -489,42 +944,148 @@ def fetch_xml_cached(url, xml_text, company, table_name, from_date, to_date):
     last_error = None
     for attempt in range(3):
         try:
-            xml = post_to_tally(url, xml_text)
+            if context:
+                context.check_cancelled()
+            if log and verbose:
+                log(f"{table_name} {label}: requesting Tally (attempt {attempt + 1}/3).")
+            started = time.perf_counter()
+            xml = post_to_tally(url, xml_text, context=context)
+            elapsed = time.perf_counter() - started
+            if context:
+                context.check_cancelled()
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w", encoding="utf-8") as handle:
                     handle.write(xml)
             except OSError:
                 pass
+            if log and verbose:
+                log(f"{table_name} {label}: received {len(xml) / 1024:.1f} KB in {elapsed:.1f}s and cached.")
             return xml
         except Exception as exc:
+            if isinstance(exc, ExportCancelled):
+                raise
             last_error = exc
-            time.sleep(1 + attempt * 2)
+            if log:
+                log(f"{table_name} {label}: attempt {attempt + 1}/3 failed: {exc}")
+            for _ in range(10 + attempt * 20):
+                if context:
+                    context.check_cancelled()
+                time.sleep(0.1)
     raise last_error
 
 
-def fetch_chunked_rows(url, company, from_date, to_date, table_name, build_request, parse_chunk):
+def fetch_chunked_rows(url, company, from_date, to_date, table_name, build_request, parse_chunk, log=None, context=None, warnings=None):
     rows = []
-    for chunk_from, chunk_to in plan_export_chunks(url, company, from_date, to_date):
+    chunks = plan_export_chunks(url, company, from_date, to_date, log, context, warnings)
+    if log:
+        log(f"{table_name}: starting {len(chunks)} chunk(s).")
+    incomplete_chunks = 0
+
+    def split_masterid_chunk(chunk, display_name, cause=None):
+        master_from = chunk.get("master_from")
+        master_to = chunk.get("master_to")
+        if master_from is None or master_to is None:
+            if cause:
+                raise cause
+            raise ValueError("Cannot split chunk without a MasterID range.")
+        master_from = int(master_from)
+        master_to = int(master_to)
+        if master_to - master_from <= 5:
+            message = (
+                "Voucher detail export failed for a very small MasterID range "
+                f"({master_from}-{master_to}). This usually points to Tally data health issues "
+                "or data exceptions in one of these vouchers. Resolve Tally data exceptions/rewrite data, "
+                "then retry this utility."
+            )
+            if cause:
+                raise ValueError(message) from cause
+            raise ValueError(message)
+        midpoint = (master_from + master_to) // 2
+        if log:
+            log(f"{table_name}: splitting MasterID range {master_from}-{master_to} into {master_from}-{midpoint} and {midpoint + 1}-{master_to}.")
+        left_chunk = dict(chunk)
+        left_chunk["master_to"] = midpoint
+        left_chunk["expected_count"] = None
+        right_chunk = dict(chunk)
+        right_chunk["master_from"] = midpoint + 1
+        right_chunk["expected_count"] = None
+        process_chunk(left_chunk, f"{display_name}.1")
+        process_chunk(right_chunk, f"{display_name}.2")
+
+    def process_chunk(chunk, display_name):
+        nonlocal incomplete_chunks
+        if context:
+            context.check_cancelled()
+        detail_log = log and should_log_chunk_detail(display_name)
+        chunk_from = chunk["from_date"]
+        chunk_to = chunk["to_date"]
         try:
-            xml = fetch_xml_cached(url, build_request(company, chunk_from, chunk_to), company, table_name, chunk_from, chunk_to)
+            if detail_log:
+                log(f"{table_name}: {display_name} started ({chunk_label(chunk)}).")
+            xml = fetch_xml_cached(url, build_request(company, chunk_from, chunk_to, chunk.get("master_from"), chunk.get("master_to")), company, table_name, chunk, log, context)
             root = parse_xml_root(xml)
+            if context:
+                context.check_cancelled()
             status = clean_text(first_descendant_text(root, "STATUS"))
             if status == "0":
                 error_text = first_descendant_text(root, "LINEERROR") or "Tally returned STATUS=0"
                 raise ValueError(error_text)
-            rows.extend(parse_chunk(root, chunk_from, chunk_to))
-        except Exception:
+            detail_header_count = count_voucher_headers(root)
+            expected_count = chunk.get("expected_count")
+            if chunk.get("master_from") is not None and expected_count is not None and detail_header_count < expected_count:
+                raise IncompleteChunkError(
+                    f"MasterID-filtered response returned {detail_header_count} detail voucher header(s), "
+                    f"but probe saw {expected_count} voucher header(s)."
+                )
+            chunk_rows = parse_chunk(root, chunk_from, chunk_to)
+            rows.extend(chunk_rows)
+            if detail_log:
+                log(f"{table_name}: {display_name} parsed {len(chunk_rows)} row(s) from {detail_header_count} voucher header(s). Total rows: {len(rows)}.")
+        except IncompleteChunkError as exc:
+            incomplete_chunks += 1
+            if detail_log:
+                log(f"{table_name}: {display_name} incomplete: {exc}")
+                if remove_cached_chunk(company, table_name, chunk):
+                    log(f"{table_name}: removed incomplete cached MasterID response for {chunk_label(chunk)}.")
+            else:
+                remove_cached_chunk(company, table_name, chunk)
+            split_masterid_chunk(chunk, display_name)
+        except ExportCancelled:
+            raise
+        except Exception as exc:
+            if log:
+                log(f"{table_name}: {display_name} failed: {exc}")
+            master_from = chunk.get("master_from")
+            master_to = chunk.get("master_to")
+            if master_from is not None and master_to is not None:
+                split_masterid_chunk(chunk, display_name, exc)
+                return
             start_date = parse_tally_date_value(chunk_from)
             end_date = parse_tally_date_value(chunk_to)
             if start_date and end_date and start_date < end_date:
+                if log:
+                    log(f"{table_name}: splitting failed chunk into daily requests.")
                 for day_start, day_end in split_period(start_date, end_date, "daily"):
+                    if context:
+                        context.check_cancelled()
                     day_from = day_start.strftime("%Y%m%d")
                     day_to = day_end.strftime("%Y%m%d")
-                    xml = fetch_xml_cached(url, build_request(company, day_from, day_to), company, table_name, day_from, day_to)
-                    rows.extend(parse_chunk(parse_xml_root(xml), day_from, day_to))
+                    day_chunk = make_date_chunk(day_from, day_to)
+                    xml = fetch_xml_cached(url, build_request(company, day_from, day_to, None, None), company, table_name, day_chunk, log, context)
+                    day_rows = parse_chunk(parse_xml_root(xml), day_from, day_to)
+                    rows.extend(day_rows)
+                    if log:
+                        log(f"{table_name}: daily chunk {format_tally_date(day_from)} parsed {len(day_rows)} row(s). Total rows: {len(rows)}.")
             else:
                 raise
+
+    for index, chunk in enumerate(chunks, start=1):
+        process_chunk(chunk, f"chunk {index}/{len(chunks)}")
+    if log:
+        if incomplete_chunks:
+            log(f"{table_name}: fallback summary: {incomplete_chunks} incomplete chunk(s) were split into smaller MasterID ranges.")
+        log(f"{table_name}: completed with {len(rows)} row(s).")
     return rows
 
 
@@ -549,12 +1110,26 @@ def build_ledger_request_xml(company):
     )
 
 
-def build_voucher_request_xml(company, from_date, to_date):
+def masterid_filter_xml(master_from=None, master_to=None):
+    if master_from is None or master_to is None:
+        return "", ""
+    try:
+        master_from = int(master_from)
+        master_to = int(master_to)
+    except (TypeError, ValueError):
+        return "", ""
+    collection_filter = "<FILTER>MasterIdRange</FILTER>"
+    formula = f"<SYSTEM TYPE=\"Formulae\" NAME=\"MasterIdRange\">$MasterID &gt;= {master_from} AND $MasterID &lt;= {master_to}</SYSTEM>"
+    return collection_filter, formula
+
+
+def build_voucher_request_xml(company, from_date, to_date, master_from=None, master_to=None):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
-    static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(from_date)}</SVFROMDATE>")
-    static_vars.append(f"<SVTODATE TYPE='Date'>{escape(to_date)}</SVTODATE>")
+    static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE>")
+    static_vars.append(f"<SVTODATE TYPE='Date'>{escape(tally_request_date(to_date))}</SVTODATE>")
+    collection_filter, filter_formula = collection_filter_xml(from_date, to_date, master_from, master_to)
 
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
@@ -568,12 +1143,14 @@ def build_voucher_request_xml(company, from_date, to_date):
         "<COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
         "</OBJECT>"
         "<COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
+        f"{collection_filter}"
         "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, "
         "PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, "
         "AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, "
         "AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, "
         "AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
         "</COLLECTION>"
+        f"{filter_formula}"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
 
@@ -598,12 +1175,13 @@ def build_stock_item_request_xml(company):
     )
 
 
-def build_inventory_entries_request_xml(company, from_date, to_date):
+def build_inventory_entries_request_xml(company, from_date, to_date, master_from=None, master_to=None):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
-    static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(from_date)}</SVFROMDATE>")
-    static_vars.append(f"<SVTODATE TYPE='Date'>{escape(to_date)}</SVTODATE>")
+    static_vars.append(f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE>")
+    static_vars.append(f"<SVTODATE TYPE='Date'>{escape(tally_request_date(to_date))}</SVTODATE>")
+    collection_filter, filter_formula = collection_filter_xml(from_date, to_date, master_from, master_to)
 
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
@@ -611,14 +1189,16 @@ def build_inventory_entries_request_xml(company, from_date, to_date):
         f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
         "<COLLECTION NAME=\"MyInventoryVouchers\"><TYPE>Voucher</TYPE>"
+        f"{collection_filter}"
         "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, "
         "InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH>"
         "</COLLECTION>"
+        f"{filter_formula}"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
 
 
-def get_company_info(host, port):
+def get_company_info(host, port, context=None):
     url = f"http://{host}:{port}"
     xml = (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
@@ -632,7 +1212,9 @@ def get_company_info(host, port):
         "<SYSTEM TYPE=\"Formulae\" NAME=\"IsActiveCompany\">$Name = ##SVCURRENTCOMPANY</SYSTEM>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
-    response = requests.post(url, data=xml.encode("utf-8"), timeout=10)
+    response = (context.session if context else requests).post(url, data=xml.encode("utf-8"), timeout=10)
+    if context:
+        context.check_cancelled()
     response.raise_for_status()
     root = ET.fromstring(xml_cleanup(response.text).encode("utf-8"))
 
@@ -647,7 +1229,7 @@ def get_company_info(host, port):
     return "", "", ""
 
 
-def fetch_tally_metadata(url, company):
+def fetch_tally_metadata(url, company, context=None):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
@@ -674,7 +1256,7 @@ def fetch_tally_metadata(url, company):
     group_map = {}
 
     try:
-        root_v = parse_xml_root(post_to_tally(url, vtype_xml))
+        root_v = parse_xml_root(post_to_tally(url, vtype_xml, context=context))
         for vt in root_v.iter():
             if strip_ns(vt.tag).upper() == "VOUCHERTYPE":
                 name = canonical_voucher_type_name(clean_text(vt.get("NAME")) or direct_child_text(vt, "NAME"))
@@ -682,7 +1264,7 @@ def fetch_tally_metadata(url, company):
                 if name:
                     vtype_map[name] = parent or name
 
-        root_g = parse_xml_root(post_to_tally(url, group_xml))
+        root_g = parse_xml_root(post_to_tally(url, group_xml, context=context))
         for grp in root_g.iter():
             if strip_ns(grp.tag).upper() == "GROUP":
                 name = direct_child_text(grp, "NAME")
@@ -709,6 +1291,8 @@ def fetch_tally_metadata(url, company):
                     g_info["Nature"] = group_map[parent].get("Nature")
                 if parent and not g_info.get("PrimaryGroup") and parent in group_map:
                     g_info["PrimaryGroup"] = group_map[parent].get("PrimaryGroup")
+    except ExportCancelled:
+        raise
     except Exception:
         pass
 
@@ -779,14 +1363,14 @@ def parse_ledgers(root, group_map=None):
     return [{column: row.get(column, "") for column in LEDGER_COLUMNS} for row in sorted(ledger_rows, key=lambda item: (int(item.get("MasterID") or 0), item.get("Name", "")))]
 
 
-def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=None):
+def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=None, diagnostics=None):
     rows = []
     formatted_from_date = format_tally_date(from_date)
     formatted_to_date = format_tally_date(to_date)
     vtype_map = vtype_map or {}
 
     for voucher in root.iter():
-        if strip_ns(voucher.tag).upper() != "VOUCHER":
+        if not is_real_voucher(voucher):
             continue
 
         voucher_type = canonical_voucher_type_name(direct_child_text(voucher, "VOUCHERTYPENAME"))
@@ -795,6 +1379,7 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=Non
 
         voucher_date = format_tally_date(direct_child_text(voucher, "DATE"))
         voucher_number = direct_child_text(voucher, "VOUCHERNUMBER")
+        header_key = voucher_header_key(voucher, voucher_date, voucher_type, voucher_number)
         party_ledger_name = direct_child_text(voucher, "PARTYLEDGERNAME") or "N/A"
         voucher_gstin = direct_child_text(voucher, "PARTYGSTIN")
         voucher_narration = first_non_empty_text(voucher, ["NARRATION", "VOUCHERNARRATION"])
@@ -805,12 +1390,19 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=Non
         if not entry_nodes:
             entry_nodes = direct_children(voucher, "LEDGERENTRIES.LIST")
 
+        rows_before = len(rows)
+        skipped_missing_ledger = 0
+        skipped_zero_amount = 0
         for entry in entry_nodes:
             ledger_name = direct_child_text(entry, "LEDGERNAME")
             amount_value = to_decimal(direct_child_text(entry, "AMOUNT"))
             is_deemed_positive = direct_child_text(entry, "ISDEEMEDPOSITIVE").upper()
 
-            if not ledger_name or amount_value == 0:
+            if not ledger_name:
+                skipped_missing_ledger += 1
+                continue
+            if amount_value == 0:
+                skipped_zero_amount += 1
                 continue
 
             base_amount = abs(amount_value)
@@ -871,6 +1463,47 @@ def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=Non
                 "VoucherCategory": voucher_category,
             })
 
+        exported_count = len(rows) - rows_before
+        reason = ""
+        if exported_count == 0:
+            if not entry_nodes:
+                reason = "No ledger entry nodes"
+            elif skipped_zero_amount and skipped_zero_amount == len(entry_nodes):
+                reason = "Only zero-amount ledger entries"
+            elif skipped_missing_ledger and skipped_missing_ledger == len(entry_nodes):
+                reason = "Ledger name missing in entries"
+            else:
+                reason = "No exported ledger rows"
+            if voucher_category != "Accounting":
+                rows.append({
+                    "Date": voucher_date,
+                    "VoucherTypeName": voucher_type,
+                    "BaseVoucherType": base_v_type,
+                    "VoucherNumber": voucher_number,
+                    "LedgerName": "",
+                    "MasterID": "",
+                    "Amount": 0.0,
+                    "DrCr": "",
+                    "DebitAmount": 0.0,
+                    "CreditAmount": 0.0,
+                    "ParentLedger": "",
+                    "PrimaryGroup": "",
+                    "Nature": "",
+                    "NatureOfGroup": "",
+                    "PAN": "",
+                    "PartyLedgerName": party_ledger_name,
+                    "PartyGSTIN": voucher_gstin,
+                    "LedgerGSTIN": "",
+                    "VoucherNarration": voucher_narration,
+                    "IsOptional": is_optional,
+                    "CompanyName": voucher_company,
+                    "FromDate": formatted_from_date,
+                    "ToDate": formatted_to_date,
+                    "VoucherCategory": voucher_category,
+                })
+                exported_count = 1
+        record_voucher_diagnostic(diagnostics, header_key, voucher_type, voucher_category, exported_count, reason)
+
     return rows
 
 
@@ -902,7 +1535,7 @@ def parse_stock_items(root):
 def parse_inventory_entries(root, company):
     rows = []
     for voucher in root.iter():
-        if strip_ns(voucher.tag).upper() != "VOUCHER":
+        if not is_real_voucher(voucher):
             continue
         v_type = direct_child_text(voucher, "VOUCHERTYPENAME")
         if "Order" in v_type:
@@ -947,14 +1580,24 @@ def parse_inventory_entries(root, company):
     return rows
 
 
-def load_tally_data(host, port, company, from_date, to_date):
+def load_tally_data(host, port, company, from_date, to_date, log=None, context=None):
+    load_started = time.perf_counter()
+    warnings = []
     url = f"http://{host}:{port}"
     selected_company = clean_text(company)
     from_date = clean_text(from_date)
     to_date = clean_text(to_date)
+    if log:
+        log(f"Load started. Target: {url}. Input company='{selected_company or '(auto)'}', from='{from_date or '(auto)'}', to='{to_date or '(auto)'}'.")
+    if context:
+        context.check_cancelled()
 
     if not selected_company or not from_date or not to_date:
-        cmp_name, cmp_start, cmp_end = get_company_info(host, port)
+        if log:
+            log("Company/date input incomplete; requesting active company metadata.")
+        cmp_name, cmp_start, cmp_end = get_company_info(host, port, context)
+        if log:
+            log(f"Company metadata received: company='{cmp_name}', starting='{format_tally_date(cmp_start)}', ending='{format_tally_date(cmp_end)}'.")
         if not selected_company:
             selected_company = cmp_name
         if not from_date:
@@ -962,12 +1605,36 @@ def load_tally_data(host, port, company, from_date, to_date):
         if not to_date:
             to_date = cmp_end
 
-    vtype_map, group_map = fetch_tally_metadata(url, selected_company)
+    if log:
+        log(f"Using company='{selected_company}', period={format_tally_date(from_date)} to {format_tally_date(to_date)}.")
+        log("Running best-effort Tally data exception preflight.")
+    exception_report, exception_summary = check_tally_data_exceptions(url, selected_company, log, context)
+    if exception_report:
+        raise ValueError(
+            "Tally data exceptions appear to exist in "
+            f"'{exception_report}'. Resolve Tally data exceptions before running voucher export. "
+            f"Details: {exception_summary}"
+        )
 
-    ledger_root = parse_xml_root(post_to_tally(url, build_ledger_request_xml(selected_company)))
+    if log:
+        log("Fetching voucher type and group metadata.")
+    started = time.perf_counter()
+    vtype_map, group_map = fetch_tally_metadata(url, selected_company, context)
+    if log:
+        log(f"Metadata received in {time.perf_counter() - started:.1f}s. Voucher types: {len(vtype_map)}. Groups: {len(group_map)}.")
+
+    if log:
+        log("Fetching ledgers.")
+    started = time.perf_counter()
+    ledger_root = parse_xml_root(post_to_tally(url, build_ledger_request_xml(selected_company), context=context))
     ledger_rows = parse_ledgers(ledger_root, group_map)
     ledger_meta = {row["Name"]: row for row in ledger_rows}
+    if log:
+        log(f"Ledgers parsed in {time.perf_counter() - started:.1f}s. Rows: {len(ledger_rows)}.")
 
+    if log:
+        log("Fetching accounting/all voucher rows with probe-based chunking.")
+    voucher_diagnostics = create_voucher_diagnostics()
     voucher_rows = fetch_chunked_rows(
         url,
         selected_company,
@@ -975,12 +1642,33 @@ def load_tally_data(host, port, company, from_date, to_date):
         to_date,
         "vouchers",
         build_voucher_request_xml,
-        lambda root, chunk_from, chunk_to: parse_vouchers(root, ledger_meta, selected_company, chunk_from, chunk_to, vtype_map),
+        lambda root, chunk_from, chunk_to: parse_vouchers(root, ledger_meta, selected_company, chunk_from, chunk_to, vtype_map, voucher_diagnostics),
+        log,
+        context,
+        warnings,
     )
+    voucher_diagnostic_summary = finalize_voucher_diagnostics(voucher_diagnostics)
+    if log:
+        log(
+            "Voucher diagnostics: "
+            f"headers in detail XML: {voucher_diagnostic_summary.get('header_count', 0)}; "
+            f"headers with exported rows: {voucher_diagnostic_summary.get('headers_with_rows', 0)}; "
+            f"headers without exported rows: {voucher_diagnostic_summary.get('headers_without_rows', 0)}."
+        )
+        log(f"Voucher diagnostics by category: {format_top_counts(voucher_diagnostic_summary.get('category_counts', {}))}")
+        log(f"Voucher diagnostics by type: {format_top_counts(voucher_diagnostic_summary.get('type_counts', {}))}")
+        log(f"Voucher diagnostics no-row reasons: {format_top_counts(voucher_diagnostic_summary.get('reason_counts', {}))}")
 
-    stock_item_root = parse_xml_root(post_to_tally(url, build_stock_item_request_xml(selected_company)))
+    if log:
+        log("Fetching stock items.")
+    started = time.perf_counter()
+    stock_item_root = parse_xml_root(post_to_tally(url, build_stock_item_request_xml(selected_company), context=context))
     stock_item_rows = parse_stock_items(stock_item_root)
+    if log:
+        log(f"Stock items parsed in {time.perf_counter() - started:.1f}s. Rows: {len(stock_item_rows)}.")
 
+    if log:
+        log("Fetching stock voucher rows with probe-based chunking.")
     inventory_rows = fetch_chunked_rows(
         url,
         selected_company,
@@ -989,46 +1677,72 @@ def load_tally_data(host, port, company, from_date, to_date):
         "inventory",
         build_inventory_entries_request_xml,
         lambda root, chunk_from, chunk_to: parse_inventory_entries(root, selected_company),
+        log,
+        context,
+        warnings,
     )
 
-    all_voucher_df = pd.DataFrame(voucher_rows)
-    if all_voucher_df.empty:
-        all_voucher_df = pd.DataFrame(columns=ALL_VOUCHER_COLUMNS)
-        voucher_df = pd.DataFrame(columns=VOUCHER_COLUMNS)
-    else:
-        voucher_df = all_voucher_df[all_voucher_df["VoucherCategory"] == "Accounting"].copy()
-    ledger_df = pd.DataFrame(ledger_rows)
-    stock_item_df = pd.DataFrame(stock_item_rows)
-    inventory_df = pd.DataFrame(inventory_rows)
+    if log:
+        log("Building final dataframes.")
+    try:
+        all_voucher_df = pd.DataFrame(voucher_rows)
+        if all_voucher_df.empty:
+            all_voucher_df = pd.DataFrame(columns=ALL_VOUCHER_COLUMNS)
+            voucher_df = pd.DataFrame(columns=VOUCHER_COLUMNS)
+        else:
+            voucher_df = all_voucher_df[all_voucher_df["VoucherCategory"] == "Accounting"].copy()
+        ledger_df = pd.DataFrame(ledger_rows)
+        stock_item_df = pd.DataFrame(stock_item_rows)
+        inventory_df = pd.DataFrame(inventory_rows)
 
-    formatted_from = format_tally_date(from_date)
-    formatted_to = format_tally_date(to_date)
+        formatted_from = format_tally_date(from_date)
+        formatted_to = format_tally_date(to_date)
 
-    final_dfs = []
-    for df, columns in [
-        (voucher_df, VOUCHER_COLUMNS),
-        (all_voucher_df, ALL_VOUCHER_COLUMNS),
-        (ledger_df, LEDGER_COLUMNS),
-        (stock_item_df, STOCK_ITEM_COLUMNS),
-        (inventory_df, STOCK_VOUCHER_COLUMNS),
-    ]:
-        df["CompanyName"] = selected_company
-        df["FromDate"] = formatted_from
-        df["ToDate"] = formatted_to
-        for column in columns:
-            if column not in df.columns:
-                df[column] = ""
-        final_dfs.append(df[columns])
+        raw_dfs = {
+            "voucher_df": (voucher_df, VOUCHER_COLUMNS),
+            "all_voucher_df": (all_voucher_df, ALL_VOUCHER_COLUMNS),
+            "ledger_df": (ledger_df, LEDGER_COLUMNS),
+            "stock_item_df": (stock_item_df, STOCK_ITEM_COLUMNS),
+            "inventory_df": (inventory_df, STOCK_VOUCHER_COLUMNS),
+        }
+        final_dfs = {}
+        for name, (df, columns) in raw_dfs.items():
+            if log:
+                log(f"Finalizing dataframe '{name}' with {len(df)} row(s).")
+            df = df.copy()
+            df["CompanyName"] = selected_company
+            df["FromDate"] = formatted_from
+            df["ToDate"] = formatted_to
+            for column in columns:
+                if column not in df.columns:
+                    df[column] = ""
+            final_dfs[name] = df.loc[:, columns]
+    except Exception:
+        if log:
+            log("Dataframe assembly failed:\n" + traceback.format_exc())
+        raise
+
+    if log:
+        category_counts = dataframe_value_counts(final_dfs["all_voucher_df"], "VoucherCategory")
+        log(
+            "Load completed in "
+            f"{time.perf_counter() - load_started:.1f}s. "
+            f"Accounting voucher rows: {len(final_dfs['voucher_df'])}. All voucher rows: {len(final_dfs['all_voucher_df'])}. "
+            f"Ledgers: {len(final_dfs['ledger_df'])}. Stock items: {len(final_dfs['stock_item_df'])}. Stock vouchers: {len(final_dfs['inventory_df'])}."
+        )
+        log(f"All voucher rows by category: {format_top_counts(category_counts)}")
 
     return {
         "company_name": selected_company,
         "from_date": from_date,
         "to_date": to_date,
-        "voucher_df": final_dfs[0],
-        "all_voucher_df": final_dfs[1],
-        "ledger_df": final_dfs[2],
-        "stock_item_df": final_dfs[3],
-        "inventory_df": final_dfs[4],
+        "voucher_df": final_dfs["voucher_df"],
+        "all_voucher_df": final_dfs["all_voucher_df"],
+        "ledger_df": final_dfs["ledger_df"],
+        "stock_item_df": final_dfs["stock_item_df"],
+        "inventory_df": final_dfs["inventory_df"],
+        "warnings": warnings,
+        "voucher_diagnostics": voucher_diagnostic_summary,
     }
 
 
@@ -1042,7 +1756,7 @@ class TallyDesktopApp:
         self.from_date_var = tk.StringVar()
         self.to_date_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
-        self.stats_var = tk.StringVar(value="Vouchers: 0 | All Vouchers: 0 | Ledgers: 0 | Stock Items: 0 | Stock Vouchers: 0")
+        self.stats_var = tk.StringVar(value="Voucher Rows: 0 | All Voucher Rows: 0 | Ledgers: 0 | Stock Items: 0 | Stock Voucher Rows: 0")
 
         self.tables = {
             "voucher_df": pd.DataFrame(columns=VOUCHER_COLUMNS),
@@ -1053,7 +1767,18 @@ class TallyDesktopApp:
         }
 
         self.treeviews = {}
+        self.log_file_path = self._create_log_file_path()
+        self.current_context = None
+        self.is_closing = False
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._log(f"Log file: {self.log_file_path}")
+
+    def _create_log_file_path(self):
+        log_dir = os.path.join(os.getcwd(), ".tally_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(log_dir, f"tally_xml_exporter_{stamp}.log")
 
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
@@ -1094,10 +1819,21 @@ class TallyDesktopApp:
 
         button_row = ttk.Frame(connection)
         button_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(button_row, text="Connect", command=self.connect_tally).pack(side="left")
-        ttk.Button(button_row, text="Load Tables", command=self.load_tables).pack(side="left", padx=6)
+        self.connect_button = ttk.Button(button_row, text="Connect", command=self.connect_tally)
+        self.connect_button.pack(side="left")
+        self.load_button = ttk.Button(button_row, text="Load Tables", command=self.load_tables)
+        self.load_button.pack(side="left", padx=6)
+        self.cancel_button = ttk.Button(button_row, text="Cancel", command=self.cancel_current_operation, state="disabled")
+        self.cancel_button.pack(side="left")
         self.progress = ttk.Progressbar(button_row, mode="indeterminate", length=180)
         self.progress.pack(side="left", padx=(10, 0))
+
+        maintenance_row = ttk.Frame(connection)
+        maintenance_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.clear_cache_button = ttk.Button(maintenance_row, text="Clear Cache", command=self.clear_cache)
+        self.clear_cache_button.pack(side="left")
+        self.clear_logs_button = ttk.Button(maintenance_row, text="Clear Logs", command=self.clear_logs)
+        self.clear_logs_button.pack(side="left", padx=6)
 
         connection.columnconfigure(1, weight=1)
 
@@ -1164,10 +1900,61 @@ class TallyDesktopApp:
             tree.column(column, width=130, anchor="w", stretch=True)
 
     def _log(self, message):
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"{message}\n")
+        self.log_text.insert("end", f"{line}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        try:
+            with open(self.log_file_path, "a", encoding="utf-8") as handle:
+                handle.write(f"{line}\n")
+        except OSError:
+            pass
+
+    def _log_from_worker(self, message):
+        self._call_ui(lambda msg=message: self._log(msg))
+
+    def _call_ui(self, callback):
+        if self.is_closing:
+            return
+        try:
+            self.root.after(0, callback)
+        except tk.TclError:
+            pass
+
+    def clear_cache(self):
+        cache_dir = os.path.join(os.getcwd(), ".tally_cache")
+        try:
+            if os.path.isdir(cache_dir):
+                file_count = sum(len(files) for _, _, files in os.walk(cache_dir))
+                shutil.rmtree(cache_dir)
+            else:
+                file_count = 0
+            self._log(f"Cache cleared. Removed {file_count} cached XML file(s).")
+            messagebox.showinfo("Cache Cleared", f"Removed {file_count} cached XML file(s).")
+        except Exception as exc:
+            self._handle_error(f"Clear cache failed: {exc}")
+
+    def clear_logs(self):
+        log_dir = os.path.join(os.getcwd(), ".tally_logs")
+        deleted = 0
+        try:
+            if os.path.isdir(log_dir):
+                for name in os.listdir(log_dir):
+                    if not name.lower().endswith(".log"):
+                        continue
+                    path = os.path.join(log_dir, name)
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        deleted += 1
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.configure(state="disabled")
+            self.log_file_path = self._create_log_file_path()
+            self._log(f"Logs cleared. Removed {deleted} log file(s). New log file: {self.log_file_path}")
+            messagebox.showinfo("Logs Cleared", f"Removed {deleted} log file(s).")
+        except Exception as exc:
+            self._handle_error(f"Clear logs failed: {exc}")
 
     def _set_status(self, message):
         self.status_var.set(message)
@@ -1177,10 +1964,27 @@ class TallyDesktopApp:
         state = "disabled" if busy else "normal"
         for entry in [self.host_entry, self.port_entry, self.company_entry, self.from_entry, self.to_entry]:
             entry.configure(state=state)
+        self.connect_button.configure(state=state)
+        self.load_button.configure(state=state)
+        self.clear_cache_button.configure(state=state)
+        self.clear_logs_button.configure(state=state)
+        self.cancel_button.configure(state="normal" if busy else "disabled")
         if busy:
             self.progress.start(10)
         else:
             self.progress.stop()
+
+    def cancel_current_operation(self):
+        context = self.current_context
+        if context:
+            self._log("Cancel requested. Closing active HTTP session and stopping after current request returns.")
+            context.cancel()
+            self.status_var.set("Cancelling...")
+
+    def _on_close(self):
+        self.is_closing = True
+        self.cancel_current_operation()
+        self.root.destroy()
 
     def _run_background(self, target):
         self._set_busy(True)
@@ -1195,11 +1999,12 @@ class TallyDesktopApp:
                 company_name, start_date, end_date = get_company_info(host, port)
                 if not company_name:
                     raise ValueError("Active company could not be detected from Tally.")
-                self.root.after(0, lambda: self._apply_connection(company_name, start_date, end_date))
+                self._call_ui(lambda: self._apply_connection(company_name, start_date, end_date))
             except Exception as exc:
-                self.root.after(0, lambda: self._handle_error(f"Connect failed: {exc}"))
+                message = f"Connect failed: {exc}"
+                self._call_ui(lambda message=message: self._handle_error(message))
             finally:
-                self.root.after(0, lambda: self._set_busy(False))
+                self._call_ui(lambda: self._set_busy(False))
 
         self._set_status("Connecting to Tally...")
         self._run_background(work)
@@ -1218,18 +2023,30 @@ class TallyDesktopApp:
 
     def load_tables(self):
         def work():
+            context = ExportRunContext()
+            self.current_context = context
             try:
                 host = self.host_entry.get().strip() or "localhost"
                 port = self.port_entry.get().strip() or "9000"
                 company = self.company_entry.get().strip()
                 from_date = self.from_entry.get().strip()
                 to_date = self.to_entry.get().strip()
-                data = load_tally_data(host, port, company, from_date, to_date)
-                self.root.after(0, lambda: self._apply_loaded_data(data))
+                data = load_tally_data(host, port, company, from_date, to_date, log=self._log_from_worker, context=context)
+                self._call_ui(lambda: self._apply_loaded_data(data))
+            except ExportCancelled as exc:
+                message = str(exc)
+                self._call_ui(lambda message=message: self._set_status(message))
             except Exception as exc:
-                self.root.after(0, lambda: self._handle_error(f"Load failed: {exc}"))
+                message = f"Load failed: {exc}"
+                self._call_ui(lambda message=message: self._handle_error(message))
             finally:
-                self.root.after(0, lambda: self._set_busy(False))
+                try:
+                    context.session.close()
+                except Exception:
+                    pass
+                if self.current_context is context:
+                    self.current_context = None
+                self._call_ui(lambda: self._set_busy(False))
 
         self._set_status("Loading tables from Tally...")
         self._run_background(work)
@@ -1244,10 +2061,25 @@ class TallyDesktopApp:
             self._populate_tree(self.treeviews[key], data[key])
 
         self.stats_var.set(
-            f"Vouchers: {len(data['voucher_df'])} | All Vouchers: {len(data['all_voucher_df'])} | Ledgers: {len(data['ledger_df'])} | "
-            f"Stock Items: {len(data['stock_item_df'])} | Stock Vouchers: {len(data['inventory_df'])}"
+            f"Voucher Rows: {len(data['voucher_df'])} | All Voucher Rows: {len(data['all_voucher_df'])} | Ledgers: {len(data['ledger_df'])} | "
+            f"Stock Items: {len(data['stock_item_df'])} | Stock Voucher Rows: {len(data['inventory_df'])}"
         )
-        self._set_status(f"Loaded data for {data['company_name']}")
+        if data.get("warnings"):
+            unique_warnings = list(dict.fromkeys(data["warnings"]))
+            warning_text = "\n\n".join(unique_warnings)
+            diag = data.get("voucher_diagnostics") or {}
+            if diag:
+                warning_text += (
+                    "\n\nVoucher diagnostics:\n"
+                    f"Headers in detail XML: {diag.get('header_count', 0)}\n"
+                    f"Headers with exported rows: {diag.get('headers_with_rows', 0)}\n"
+                    f"Headers without exported rows: {diag.get('headers_without_rows', 0)}\n"
+                    f"No-row reasons: {format_top_counts(diag.get('reason_counts', {}), limit=5)}"
+                )
+            self._set_status(f"Loaded with warnings: {unique_warnings[0]}")
+            messagebox.showwarning("Tally Data Warning", warning_text)
+        else:
+            self._set_status(f"Loaded data for {data['company_name']}")
 
     def _populate_tree(self, tree, df):
         tree.delete(*tree.get_children())
