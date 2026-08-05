@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QDate>
+#include <QDateTime>
 #include <QEventLoop>
 #include <QDir>
 #include <QFile>
@@ -16,6 +17,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringConverter>
+#include <QTextStream>
 #include <QTimer>
 #include <QUrl>
 #include <QDomDocument>
@@ -442,6 +444,91 @@ QString numberToString(double value) {
     return QString::number(value, 'f', 2);
 }
 
+QString csvEscape(const QString &value) {
+    QString escaped = value;
+    escaped.replace('"', "\"\"");
+    if (escaped.contains(',') || escaped.contains('"') || escaped.contains('\n') || escaped.contains('\r')) {
+        return "\"" + escaped + "\"";
+    }
+    return escaped;
+}
+
+QString makeSessionDir() {
+    const QString root = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + "/TallyQtExporter";
+    const QString stamp = QDateTime::currentDateTimeUtc().toString("yyyyMMdd_HHmmss_zzz");
+    const QString path = root + "/" + stamp;
+    QDir().mkpath(path);
+    return path;
+}
+
+class CsvTableWriter {
+public:
+    CsvTableWriter() = default;
+
+    CsvTableWriter(const QString &path, const QStringList &columns)
+        : path_(path), columns_(columns), file_(path) {
+        QDir().mkpath(QFileInfo(path).absolutePath());
+        if (!file_.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            throw std::runtime_error(QString("Unable to create export cache file: %1").arg(path).toStdString());
+        }
+        stream_.setDevice(&file_);
+        stream_.setEncoding(QStringConverter::Utf8);
+        stream_ << QChar(0xFEFF);
+        writeValues(columns_);
+    }
+
+    void appendRow(QVariantMap row, const QString &companyName, const QString &fromDate, const QString &toDate) {
+        row.insert("CompanyName", companyName);
+        row.insert("FromDate", formatTallyDate(fromDate));
+        row.insert("ToDate", formatTallyDate(toDate));
+        QStringList values;
+        values.reserve(columns_.size());
+        for (const QString &column : columns_) {
+            values << row.value(column).toString();
+        }
+        writeValues(values);
+        ++rowCount_;
+    }
+
+    void appendRows(const QVector<QVariantMap> &rows, const QString &companyName, const QString &fromDate, const QString &toDate) {
+        for (const QVariantMap &row : rows) {
+            appendRow(row, companyName, fromDate, toDate);
+        }
+    }
+
+    void flush() {
+        stream_.flush();
+        file_.flush();
+    }
+
+    TallyTable table(const QString &id, const QString &title, const QString &fileName) const {
+        TallyTable table;
+        table.id = id;
+        table.title = title;
+        table.defaultFileName = fileName;
+        table.columns = columns_;
+        table.csvPath = path_;
+        table.rowCount = rowCount_;
+        return table;
+    }
+
+private:
+    void writeValues(const QStringList &values) {
+        QStringList escaped;
+        escaped.reserve(values.size());
+        for (const QString &value : values) {
+            escaped << csvEscape(value);
+        }
+        stream_ << escaped.join(',') << "\n";
+    }
+
+    QString path_;
+    QStringList columns_;
+    QFile file_;
+    QTextStream stream_;
+    int rowCount_ = 0;
+};
+
 QPair<QString, QString> natureFromPrimaryGroup(const QString &primaryGroup) {
     const QString pg = cleanText(primaryGroup).toLower();
     if (QStringList({
@@ -798,6 +885,102 @@ QVector<QVariantMap> fetchChunkedRows(
     }
     emitLog(QString("%1: completed with %2 row(s).").arg(tableName).arg(rows.size()));
     return rows;
+}
+
+int fetchChunkedRowsStream(
+    const QString &url,
+    const QString &company,
+    const QString &fromDate,
+    const QString &toDate,
+    const QString &tableName,
+    const std::function<QString(const QString &, const QString &, const QString &, int, int)> &buildRequest,
+    const std::function<QVector<QVariantMap>(const QDomDocument &, const QString &, const QString &)> &parseChunk,
+    const std::function<void(const QVector<QVariantMap> &)> &handleRows) {
+    int totalRows = 0;
+    std::function<void(const ExportChunk &)> processChunk;
+    int chunkIndex = 0;
+    const QVector<ExportChunk> chunks = planExportChunks(url, company, fromDate, toDate);
+    emitLog(QString("%1: starting %2 chunk(s).").arg(tableName, QString::number(chunks.size())));
+    processChunk = [&](const ExportChunk &chunk) {
+        ++chunkIndex;
+        const QString chunkFrom = chunk.fromDate;
+        const QString chunkTo = chunk.toDate;
+        const bool logChunk = chunks.size() <= 20 || chunkIndex <= 5 || chunkIndex == chunks.size() || chunkIndex % 50 == 0;
+        try {
+            if (logChunk) {
+                const QString label = QString("%1/%2").arg(chunkIndex).arg(chunks.size());
+                if (chunk.masterFrom >= 0) {
+                    emitLog(QString("%1: chunk %2 started, MasterID %3-%4, expected vouchers %5.")
+                                .arg(tableName, label)
+                                .arg(chunk.masterFrom)
+                                .arg(chunk.masterTo)
+                                .arg(chunk.expectedCount));
+                } else {
+                    emitLog(QString("%1: chunk %2 started, %3 to %4.").arg(tableName, label, formatTallyDate(chunkFrom), formatTallyDate(chunkTo)));
+                }
+            }
+            const QString xml = fetchXmlCached(url, buildRequest(company, chunkFrom, chunkTo, chunk.masterFrom, chunk.masterTo), company, tableName, chunk);
+            const QDomDocument doc = parseXmlRoot(xml);
+            const QString status = cleanText(firstDescendantText(doc.documentElement(), "STATUS"));
+            if (status == "0") {
+                const QString errorText = firstDescendantText(doc.documentElement(), "LINEERROR");
+                throw std::runtime_error((errorText.isEmpty() ? QString("Tally returned STATUS=0") : errorText).toStdString());
+            }
+            const QVector<QVariantMap> chunkRows = parseChunk(doc, chunkFrom, chunkTo);
+            if (chunk.masterFrom >= 0 && chunk.expectedCount >= 0) {
+                const int detailCount = countRealVouchers(doc);
+                if (detailCount > 0 && detailCount < chunk.expectedCount) {
+                    throw std::runtime_error(QString("MasterID-filtered response returned %1 voucher header(s), expected %2.")
+                                                 .arg(detailCount)
+                                                 .arg(chunk.expectedCount)
+                                                 .toStdString());
+                }
+            }
+            handleRows(chunkRows);
+            totalRows += chunkRows.size();
+            if (logChunk) {
+                emitLog(QString("%1: chunk parsed %2 row(s) from %3 voucher header(s). Total rows: %4.")
+                            .arg(tableName)
+                            .arg(chunkRows.size())
+                            .arg(countRealVouchers(doc))
+                            .arg(totalRows));
+            }
+        } catch (...) {
+            if (chunk.masterFrom >= 0 && chunk.masterTo >= 0) {
+                if (chunk.masterTo - chunk.masterFrom <= 5) {
+                    throw;
+                }
+                const int midpoint = (chunk.masterFrom + chunk.masterTo) / 2;
+                ExportChunk left = chunk;
+                left.masterTo = midpoint;
+                left.expectedCount = -1;
+                ExportChunk right = chunk;
+                right.masterFrom = midpoint + 1;
+                right.expectedCount = -1;
+                emitLog(QString("%1: splitting MasterID range %2-%3 into smaller ranges.").arg(tableName).arg(chunk.masterFrom).arg(chunk.masterTo));
+                processChunk(left);
+                processChunk(right);
+                return;
+            }
+            const QDate startDate = parseTallyDateValue(chunkFrom);
+            const QDate endDate = parseTallyDateValue(chunkTo);
+            if (!startDate.isValid() || !endDate.isValid() || startDate >= endDate) {
+                throw;
+            }
+            for (const auto &day : splitPeriod(startDate, endDate, "daily")) {
+                ExportChunk dayChunk{day.first, day.second, -1, -1, -1};
+                const QString xml = fetchXmlCached(url, buildRequest(company, day.first, day.second, -1, -1), company, tableName, dayChunk);
+                const QVector<QVariantMap> dayRows = parseChunk(parseXmlRoot(xml), day.first, day.second);
+                handleRows(dayRows);
+                totalRows += dayRows.size();
+            }
+        }
+    };
+    for (const auto &chunk : chunks) {
+        processChunk(chunk);
+    }
+    emitLog(QString("%1: completed with %2 row(s).").arg(tableName).arg(totalRows));
+    return totalRows;
 }
 
 QString buildLedgerRequestXml(const QString &company) {
@@ -1378,6 +1561,7 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
                     .arg(info.name, formatTallyDate(info.startDateRaw), formatTallyDate(info.endDateRaw)));
     }
     emitLog(QString("Using company='%1', period=%2 to %3.").arg(selectedCompany, formatTallyDate(selectedFrom), formatTallyDate(selectedTo)));
+    const QString sessionDir = makeSessionDir();
 
     emitLog("Fetching voucher type and group metadata.");
     const auto metadata = fetchTallyMetadata(url, selectedCompany);
@@ -1394,8 +1578,17 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
     }
     emitLog(QString("Ledgers parsed. Rows: %1.").arg(ledgerRows.size()));
 
+    CsvTableWriter voucherWriter(sessionDir + "/vouchers.csv", kVoucherColumns);
+    CsvTableWriter allVoucherWriter(sessionDir + "/allvouchers.csv", kAllVoucherColumns);
+    CsvTableWriter ledgerWriter(sessionDir + "/ledgers.csv", kLedgerColumns);
+    CsvTableWriter stockItemWriter(sessionDir + "/stock_items.csv", kStockItemColumns);
+    CsvTableWriter inventoryWriter(sessionDir + "/stock_vouchers.csv", kStockVoucherColumns);
+
+    ledgerWriter.appendRows(ledgerRows, selectedCompany, selectedFrom, selectedTo);
+
     emitLog("Fetching accounting/all voucher rows with Tally-side flat ledger-entry TDL and probe-based chunking.");
-    const QVector<QVariantMap> allVoucherRows = fetchChunkedRows(
+    int voucherCount = 0;
+    const int allVoucherCount = fetchChunkedRowsStream(
         url,
         selectedCompany,
         selectedFrom,
@@ -1404,21 +1597,25 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
         buildFlatVoucherRequestXml,
         [&](const QDomDocument &doc, const QString &chunkFrom, const QString &chunkTo) {
             return parseFlatVouchers(doc, ledgerMeta, selectedCompany, chunkFrom, chunkTo, vtypeMap);
+        },
+        [&](const QVector<QVariantMap> &chunkRows) {
+            allVoucherWriter.appendRows(chunkRows, selectedCompany, selectedFrom, selectedTo);
+            for (const QVariantMap &row : chunkRows) {
+                if (row.value("VoucherCategory").toString() == "Accounting") {
+                    voucherWriter.appendRow(row, selectedCompany, selectedFrom, selectedTo);
+                    ++voucherCount;
+                }
+            }
         });
-    QVector<QVariantMap> voucherRows;
-    for (const QVariantMap &row : allVoucherRows) {
-        if (row.value("VoucherCategory").toString() == "Accounting") {
-            voucherRows.append(row);
-        }
-    }
 
     emitLog("Fetching stock items.");
     const QDomDocument stockDoc = parseXmlRoot(postToTally(url, buildStockItemRequestXml(selectedCompany)));
     const QVector<QVariantMap> stockRows = parseStockItems(stockDoc);
+    stockItemWriter.appendRows(stockRows, selectedCompany, selectedFrom, selectedTo);
     emitLog(QString("Stock items parsed. Rows: %1.").arg(stockRows.size()));
 
     emitLog("Fetching stock voucher rows with Tally-side flat inventory-entry TDL and probe-based chunking.");
-    const QVector<QVariantMap> inventoryRows = fetchChunkedRows(
+    const int inventoryCount = fetchChunkedRowsStream(
         url,
         selectedCompany,
         selectedFrom,
@@ -1427,23 +1624,31 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
         buildFlatInventoryEntriesRequestXml,
         [&](const QDomDocument &doc, const QString &, const QString &) {
             return parseFlatInventoryEntries(doc, selectedCompany);
+        },
+        [&](const QVector<QVariantMap> &chunkRows) {
+            inventoryWriter.appendRows(chunkRows, selectedCompany, selectedFrom, selectedTo);
         });
+    voucherWriter.flush();
+    allVoucherWriter.flush();
+    ledgerWriter.flush();
+    stockItemWriter.flush();
+    inventoryWriter.flush();
 
     TallyDataBundle bundle;
     bundle.companyName = selectedCompany;
     bundle.fromDateRaw = selectedFrom;
     bundle.toDateRaw = selectedTo;
-    bundle.tables.insert("voucher_df", makeTable("voucher_df", "Vouchers", "vouchers.csv", kVoucherColumns, voucherRows, selectedCompany, selectedFrom, selectedTo));
-    bundle.tables.insert("all_voucher_df", makeTable("all_voucher_df", "All Vouchers", "allvouchers.csv", kAllVoucherColumns, allVoucherRows, selectedCompany, selectedFrom, selectedTo));
-    bundle.tables.insert("ledger_df", makeTable("ledger_df", "Ledgers", "ledgers.csv", kLedgerColumns, ledgerRows, selectedCompany, selectedFrom, selectedTo));
-    bundle.tables.insert("stock_item_df", makeTable("stock_item_df", "Stock Items", "stock_items.csv", kStockItemColumns, stockRows, selectedCompany, selectedFrom, selectedTo));
-    bundle.tables.insert("inventory_df", makeTable("inventory_df", "Stock Vouchers", "stock_vouchers.csv", kStockVoucherColumns, inventoryRows, selectedCompany, selectedFrom, selectedTo));
+    bundle.tables.insert("voucher_df", voucherWriter.table("voucher_df", "Vouchers", "vouchers.csv"));
+    bundle.tables.insert("all_voucher_df", allVoucherWriter.table("all_voucher_df", "All Vouchers", "allvouchers.csv"));
+    bundle.tables.insert("ledger_df", ledgerWriter.table("ledger_df", "Ledgers", "ledgers.csv"));
+    bundle.tables.insert("stock_item_df", stockItemWriter.table("stock_item_df", "Stock Items", "stock_items.csv"));
+    bundle.tables.insert("inventory_df", inventoryWriter.table("inventory_df", "Stock Vouchers", "stock_vouchers.csv"));
     emitLog(
         QString("Load completed. Accounting voucher rows: %1. All voucher rows: %2. Ledgers: %3. Stock items: %4. Stock vouchers: %5.")
-            .arg(voucherRows.size())
-            .arg(allVoucherRows.size())
+            .arg(voucherCount)
+            .arg(allVoucherCount)
             .arg(ledgerRows.size())
             .arg(stockRows.size())
-            .arg(inventoryRows.size()));
+            .arg(inventoryCount));
     return bundle;
 }

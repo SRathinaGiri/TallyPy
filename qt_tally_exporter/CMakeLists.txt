@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(TallyQtExporter VERSION 0.1.4 LANGUAGES CXX)
+project(TallyQtExporter VERSION 0.1.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Xml)
 
 qt_add_executable(TallyQtExporter
     src/main.cpp
+    src/BannerDialog.cpp
     src/MainWindow.cpp
     src/TallyService.cpp
     resources/resources.qrc

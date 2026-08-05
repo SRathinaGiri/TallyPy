@@ -12,6 +12,8 @@ struct TallyTable {
     QString title;
     QString defaultFileName;
     QStringList columns;
+    QString csvPath;
+    int rowCount = 0;
     QVector<QVariantMap> rows;
 };
 

@@ -1,5 +1,6 @@
 <RCC>
   <qresource prefix="/">
     <file>../assets/app_icon.ico</file>
+    <file>../assets/tally_qt_banner.png</file>
   </qresource>
 </RCC>

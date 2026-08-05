@@ -1,5 +1,8 @@
 #include "MainWindow.h"
 
+#include "BannerDialog.h"
+
+#include <QAbstractTableModel>
 #include <QApplication>
 #include <QDateTime>
 #include <QFile>
@@ -15,22 +18,15 @@
 #include <QPushButton>
 #include <QRect>
 #include <QScreen>
+#include <QSettings>
 #include <QSplitter>
 #include <QStandardPaths>
+#include <QStringConverter>
 #include <QTextStream>
 #include <QVBoxLayout>
 #include <thread>
 
 namespace {
-QString csvEscape(const QString &value) {
-    QString escaped = value;
-    escaped.replace('"', "\"\"");
-    if (escaped.contains(',') || escaped.contains('"') || escaped.contains('\n') || escaped.contains('\r')) {
-        return "\"" + escaped + "\"";
-    }
-    return escaped;
-}
-
 QRect initialWindowGeometry() {
     constexpr int preferredWidth = 1320;
     constexpr int preferredHeight = 840;
@@ -48,6 +44,120 @@ QRect initialWindowGeometry() {
     const int y = available.y() + qMax(0, (available.height() - height) / 2);
     return QRect(x, y, width, height);
 }
+
+QStringList parseCsvLine(const QString &line) {
+    QStringList values;
+    QString value;
+    bool quoted = false;
+    for (int i = 0; i < line.size(); ++i) {
+        const QChar ch = line.at(i);
+        if (quoted) {
+            if (ch == '"') {
+                if (i + 1 < line.size() && line.at(i + 1) == '"') {
+                    value.append('"');
+                    ++i;
+                } else {
+                    quoted = false;
+                }
+            } else {
+                value.append(ch);
+            }
+        } else if (ch == '"') {
+            quoted = true;
+        } else if (ch == ',') {
+            values.append(value);
+            value.clear();
+        } else {
+            value.append(ch);
+        }
+    }
+    values.append(value);
+    return values;
+}
+
+QString trimCsvLine(QString line) {
+    if (line.endsWith('\n')) {
+        line.chop(1);
+    }
+    if (line.endsWith('\r')) {
+        line.chop(1);
+    }
+    return line;
+}
+
+class CsvTableModel final : public QAbstractTableModel {
+public:
+    explicit CsvTableModel(const TallyTable &table, QObject *parent = nullptr)
+        : QAbstractTableModel(parent), table_(table), file_(table.csvPath) {
+        buildIndex();
+    }
+
+    int rowCount(const QModelIndex &parent = QModelIndex()) const override {
+        return parent.isValid() ? 0 : offsets_.size();
+    }
+
+    int columnCount(const QModelIndex &parent = QModelIndex()) const override {
+        return parent.isValid() ? 0 : table_.columns.size();
+    }
+
+    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override {
+        if (!index.isValid() || role != Qt::DisplayRole || index.column() < 0 || index.column() >= table_.columns.size()) {
+            return {};
+        }
+        const QStringList row = rowValues(index.row());
+        return index.column() < row.size() ? row.at(index.column()) : QString();
+    }
+
+    QVariant headerData(int section, Qt::Orientation orientation, int role = Qt::DisplayRole) const override {
+        if (role != Qt::DisplayRole) {
+            return {};
+        }
+        if (orientation == Qt::Horizontal) {
+            return section >= 0 && section < table_.columns.size() ? table_.columns.at(section) : QVariant();
+        }
+        return section + 1;
+    }
+
+private:
+    void buildIndex() {
+        QFile file(table_.csvPath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            return;
+        }
+        file.readLine();
+        while (!file.atEnd()) {
+            const qint64 offset = file.pos();
+            const QByteArray line = file.readLine();
+            if (!line.isEmpty()) {
+                offsets_.append(offset);
+            }
+        }
+    }
+
+    QStringList rowValues(int row) const {
+        if (row < 0 || row >= offsets_.size()) {
+            return {};
+        }
+        if (row == cachedRow_) {
+            return cachedValues_;
+        }
+        if (!file_.isOpen() && !file_.open(QIODevice::ReadOnly)) {
+            return {};
+        }
+        if (!file_.seek(offsets_.at(row))) {
+            return {};
+        }
+        cachedRow_ = row;
+        cachedValues_ = parseCsvLine(trimCsvLine(QString::fromUtf8(file_.readLine())));
+        return cachedValues_;
+    }
+
+    TallyTable table_;
+    QVector<qint64> offsets_;
+    mutable QFile file_;
+    mutable int cachedRow_ = -1;
+    mutable QStringList cachedValues_;
+};
 }
 
 MainWindow::MainWindow() {
@@ -106,8 +216,10 @@ void MainWindow::buildUi() {
     auto *maintenanceLayout = new QHBoxLayout();
     clearCacheButton_ = new QPushButton("Clear Cache", connectionBox);
     clearLogsButton_ = new QPushButton("Clear Logs", connectionBox);
+    aboutButton_ = new QPushButton("About", connectionBox);
     maintenanceLayout->addWidget(clearCacheButton_);
     maintenanceLayout->addWidget(clearLogsButton_);
+    maintenanceLayout->addWidget(aboutButton_);
     maintenanceLayout->addStretch(1);
     connectionLayout->addLayout(maintenanceLayout, 6, 0, 1, 2);
 
@@ -121,6 +233,9 @@ void MainWindow::buildUi() {
     detectedToEdit_->setReadOnly(true);
     statusLabel_ = new QLabel("Ready", detailsBox);
     statsLabel_ = new QLabel("Vouchers: 0 | All Vouchers: 0 | Ledgers: 0 | Stock Items: 0 | Stock Vouchers: 0", detailsBox);
+    exportDirEdit_ = new QLineEdit(detailsBox);
+    browseExportDirButton_ = new QPushButton("Browse", detailsBox);
+    overwriteCheckBox_ = new QCheckBox("Overwrite existing files", detailsBox);
 
     detailsLayout->addWidget(new QLabel("Company", detailsBox), 0, 0);
     detailsLayout->addWidget(detectedCompanyEdit_, 0, 1);
@@ -131,6 +246,12 @@ void MainWindow::buildUi() {
     detailsLayout->addWidget(new QLabel("Status", detailsBox), 3, 0);
     detailsLayout->addWidget(statusLabel_, 3, 1);
     detailsLayout->addWidget(statsLabel_, 4, 0, 1, 2);
+    detailsLayout->addWidget(new QLabel("Export Folder", detailsBox), 5, 0);
+    auto *exportDirLayout = new QHBoxLayout();
+    exportDirLayout->addWidget(exportDirEdit_);
+    exportDirLayout->addWidget(browseExportDirButton_);
+    detailsLayout->addLayout(exportDirLayout, 5, 1);
+    detailsLayout->addWidget(overwriteCheckBox_, 6, 1);
 
     auto *exportButtonsLayout = new QHBoxLayout();
     auto *exportAllButton = new QPushButton("Export All CSVs", detailsBox);
@@ -146,7 +267,7 @@ void MainWindow::buildUi() {
     exportButtonsLayout->addWidget(exportStockItemsButton);
     exportButtonsLayout->addWidget(exportStockVouchersButton);
     exportButtonsLayout->addStretch(1);
-    detailsLayout->addLayout(exportButtonsLayout, 5, 0, 1, 2);
+    detailsLayout->addLayout(exportButtonsLayout, 7, 0, 1, 2);
 
     topLayout->addWidget(connectionBox, 1);
     topLayout->addWidget(detailsBox, 1);
@@ -171,15 +292,19 @@ void MainWindow::buildUi() {
     for (const auto &table : tableDefs) {
         auto *page = new QWidget(tabWidget_);
         auto *layout = new QVBoxLayout(page);
-        auto *tableWidget = new QTableWidget(page);
-        tableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
-        tableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
-        tableWidget->setAlternatingRowColors(true);
-        tableWidget->horizontalHeader()->setStretchLastSection(false);
-        tableWidget->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-        layout->addWidget(tableWidget);
+        auto *tableView = new QTableView(page);
+        tableView->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        tableView->setSelectionBehavior(QAbstractItemView::SelectRows);
+        tableView->setAlternatingRowColors(true);
+        tableView->setSortingEnabled(false);
+        tableView->setWordWrap(false);
+        tableView->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+        tableView->horizontalHeader()->setStretchLastSection(false);
+        tableView->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+        tableView->verticalHeader()->setDefaultSectionSize(22);
+        layout->addWidget(tableView);
         tabWidget_->addTab(page, table.title);
-        tableWidgets_.insert(table.id, tableWidget);
+        tableViews_.insert(table.id, tableView);
         tables_.insert(table.id, table);
     }
 
@@ -191,12 +316,17 @@ void MainWindow::buildUi() {
     connect(cancelButton_, &QPushButton::clicked, this, [this]() { cancelCurrentOperation(); });
     connect(clearCacheButton_, &QPushButton::clicked, this, [this]() { clearCache(); });
     connect(clearLogsButton_, &QPushButton::clicked, this, [this]() { clearLogs(); });
+    connect(aboutButton_, &QPushButton::clicked, this, [this]() { showAbout(); });
+    connect(browseExportDirButton_, &QPushButton::clicked, this, [this]() { chooseExportDirectory(); });
+    connect(exportDirEdit_, &QLineEdit::editingFinished, this, [this]() { saveExportSettings(); });
+    connect(overwriteCheckBox_, &QCheckBox::toggled, this, [this]() { saveExportSettings(); });
     connect(exportAllButton, &QPushButton::clicked, this, [this]() { exportAllTables(); });
     connect(exportVouchersButton, &QPushButton::clicked, this, [this]() { exportTable("voucher_df"); });
     connect(exportAllVouchersButton, &QPushButton::clicked, this, [this]() { exportTable("all_voucher_df"); });
     connect(exportLedgersButton, &QPushButton::clicked, this, [this]() { exportTable("ledger_df"); });
     connect(exportStockItemsButton, &QPushButton::clicked, this, [this]() { exportTable("stock_item_df"); });
     connect(exportStockVouchersButton, &QPushButton::clicked, this, [this]() { exportTable("inventory_df"); });
+    loadExportSettings();
 }
 
 void MainWindow::connectToTally() {
@@ -330,6 +460,34 @@ void MainWindow::clearLogs() {
     QMessageBox::information(this, "Logs Cleared", QString("Removed %1 log file(s).").arg(removed));
 }
 
+void MainWindow::showAbout() {
+    BannerDialog dialog(this);
+    dialog.setWindowIcon(windowIcon());
+    dialog.exec();
+}
+
+void MainWindow::chooseExportDirectory() {
+    const QString startDir = defaultExportDirectory();
+    const QString folder = QFileDialog::getExistingDirectory(this, "Select Default Export Folder", startDir);
+    if (folder.isEmpty()) {
+        return;
+    }
+    exportDirEdit_->setText(QDir::toNativeSeparators(folder));
+    saveExportSettings();
+}
+
+void MainWindow::loadExportSettings() {
+    QSettings settings;
+    exportDirEdit_->setText(QDir::toNativeSeparators(settings.value("export/defaultDirectory").toString()));
+    overwriteCheckBox_->setChecked(settings.value("export/overwriteExisting", false).toBool());
+}
+
+void MainWindow::saveExportSettings() const {
+    QSettings settings;
+    settings.setValue("export/defaultDirectory", QDir::fromNativeSeparators(exportDirEdit_->text().trimmed()));
+    settings.setValue("export/overwriteExisting", overwriteCheckBox_->isChecked());
+}
+
 void MainWindow::applyLoadedData(const TallyDataBundle &bundle) {
     detectedCompanyEdit_->setText(bundle.companyName);
     detectedFromEdit_->setText(formatRawDate(bundle.fromDateRaw));
@@ -343,12 +501,12 @@ void MainWindow::applyLoadedData(const TallyDataBundle &bundle) {
 
     for (auto it = bundle.tables.constBegin(); it != bundle.tables.constEnd(); ++it) {
         tables_[it.key()] = it.value();
-        populateTableWidget(tableWidgets_.value(it.key()), it.value());
-        if (it.key() == "voucher_df") voucherCount = it.value().rows.size();
-        if (it.key() == "all_voucher_df") allVoucherCount = it.value().rows.size();
-        if (it.key() == "ledger_df") ledgerCount = it.value().rows.size();
-        if (it.key() == "stock_item_df") stockItemCount = it.value().rows.size();
-        if (it.key() == "inventory_df") inventoryCount = it.value().rows.size();
+        populateTableView(tableViews_.value(it.key()), it.value());
+        if (it.key() == "voucher_df") voucherCount = it.value().rowCount;
+        if (it.key() == "all_voucher_df") allVoucherCount = it.value().rowCount;
+        if (it.key() == "ledger_df") ledgerCount = it.value().rowCount;
+        if (it.key() == "stock_item_df") stockItemCount = it.value().rowCount;
+        if (it.key() == "inventory_df") inventoryCount = it.value().rowCount;
     }
 
     statsLabel_->setText(QString("Vouchers: %1 | All Vouchers: %2 | Ledgers: %3 | Stock Items: %4 | Stock Vouchers: %5")
@@ -364,14 +522,25 @@ void MainWindow::applyLoadedData(const TallyDataBundle &bundle) {
 
 void MainWindow::exportTable(const QString &tableId) {
     const TallyTable table = tables_.value(tableId);
-    if (table.rows.isEmpty()) {
+    if (table.rowCount == 0 || table.csvPath.isEmpty()) {
         QMessageBox::warning(this, "Tally Qt Exporter", "This table is empty. Load data first.");
         return;
     }
 
-    const QString path = QFileDialog::getSaveFileName(this, "Save CSV", table.defaultFileName, "CSV Files (*.csv)");
-    if (path.isEmpty()) {
-        return;
+    QString path;
+    const QString exportDir = defaultExportDirectory();
+    if (!exportDir.isEmpty()) {
+        QDir dir(exportDir);
+        if (!dir.exists() && !dir.mkpath(".")) {
+            QMessageBox::critical(this, "Tally Qt Exporter", "Unable to create export folder: " + exportDir);
+            return;
+        }
+        path = dir.filePath(table.defaultFileName);
+    } else {
+        path = QFileDialog::getSaveFileName(this, "Save CSV", table.defaultFileName, "CSV Files (*.csv)");
+        if (path.isEmpty()) {
+            return;
+        }
     }
 
     QString errorMessage;
@@ -381,12 +550,13 @@ void MainWindow::exportTable(const QString &tableId) {
     }
 
     setStatus("Saved " + QFileInfo(path).fileName());
+    logMessage("Exported " + path);
 }
 
 void MainWindow::exportAllTables() {
     bool hasAnyData = false;
     for (auto it = tables_.constBegin(); it != tables_.constEnd(); ++it) {
-        if (!it.value().rows.isEmpty()) {
+        if (it.value().rowCount > 0 && !it.value().csvPath.isEmpty()) {
             hasAnyData = true;
             break;
         }
@@ -396,13 +566,24 @@ void MainWindow::exportAllTables() {
         return;
     }
 
-    const QString folder = QFileDialog::getExistingDirectory(this, "Select Export Folder");
+    QString folder = defaultExportDirectory();
     if (folder.isEmpty()) {
+        folder = QFileDialog::getExistingDirectory(this, "Select Export Folder");
+    }
+    if (folder.isEmpty()) {
+        return;
+    }
+    QDir dir(folder);
+    if (!dir.exists() && !dir.mkpath(".")) {
+        QMessageBox::critical(this, "Tally Qt Exporter", "Unable to create export folder: " + folder);
         return;
     }
 
     for (auto it = tables_.constBegin(); it != tables_.constEnd(); ++it) {
-        const QString path = folder + "/" + it.value().defaultFileName;
+        if (it.value().rowCount == 0 || it.value().csvPath.isEmpty()) {
+            continue;
+        }
+        const QString path = dir.filePath(it.value().defaultFileName);
         QString errorMessage;
         if (!writeCsvFile(path, it.value(), &errorMessage)) {
             QMessageBox::critical(this, "Tally Qt Exporter", errorMessage);
@@ -411,50 +592,59 @@ void MainWindow::exportAllTables() {
     }
 
     setStatus("Exported all CSVs");
+    logMessage("Exported all CSVs to " + QDir::toNativeSeparators(dir.absolutePath()));
     QMessageBox::information(this, "Tally Qt Exporter", "All CSV files were exported successfully.");
 }
 
-void MainWindow::populateTableWidget(QTableWidget *tableWidget, const TallyTable &table) {
-    if (!tableWidget) {
+void MainWindow::populateTableView(QTableView *tableView, const TallyTable &table) {
+    if (!tableView) {
         return;
     }
 
-    tableWidget->clear();
-    tableWidget->setColumnCount(table.columns.size());
-    tableWidget->setHorizontalHeaderLabels(table.columns);
-    tableWidget->setRowCount(table.rows.size());
-
-    for (int rowIndex = 0; rowIndex < table.rows.size(); ++rowIndex) {
-        const QVariantMap &row = table.rows[rowIndex];
-        for (int colIndex = 0; colIndex < table.columns.size(); ++colIndex) {
-            const QString &column = table.columns[colIndex];
-            auto *item = new QTableWidgetItem(row.value(column).toString());
-            tableWidget->setItem(rowIndex, colIndex, item);
-        }
+    if (QAbstractItemModel *oldModel = tableModels_.take(table.id)) {
+        oldModel->deleteLater();
     }
+    auto *model = new CsvTableModel(table, tableView);
+    tableModels_.insert(table.id, model);
+    tableView->setModel(model);
+    tableView->horizontalHeader()->setDefaultSectionSize(140);
 }
 
 bool MainWindow::writeCsvFile(const QString &path, const TallyTable &table, QString *errorMessage) {
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+    if (table.csvPath.isEmpty() || !QFileInfo::exists(table.csvPath)) {
         if (errorMessage) {
-            *errorMessage = "Unable to open file for writing: " + path;
+            *errorMessage = "The generated table file is missing. Load data again.";
         }
         return false;
     }
-
-    QTextStream out(&file);
-    out.setEncoding(QStringConverter::Utf8);
-    out << QChar(0xFEFF);
-    out << table.columns.join(',') << "\n";
-    for (const QVariantMap &row : table.rows) {
-        QStringList values;
-        for (const QString &column : table.columns) {
-            values << csvEscape(row.value(column).toString());
+    if (QFileInfo(table.csvPath).absoluteFilePath() == QFileInfo(path).absoluteFilePath()) {
+        return true;
+    }
+    if (QFileInfo::exists(path)) {
+        if (!overwriteCheckBox_->isChecked()) {
+            if (errorMessage) {
+                *errorMessage = "File already exists and overwrite is disabled: " + path;
+            }
+            return false;
         }
-        out << values.join(',') << "\n";
+        if (!QFile::remove(path)) {
+            if (errorMessage) {
+                *errorMessage = "Unable to overwrite file: " + path;
+            }
+            return false;
+        }
+    }
+    if (!QFile::copy(table.csvPath, path)) {
+        if (errorMessage) {
+            *errorMessage = "Unable to save file: " + path;
+        }
+        return false;
     }
     return true;
+}
+
+QString MainWindow::defaultExportDirectory() const {
+    return QDir::fromNativeSeparators(exportDirEdit_->text().trimmed());
 }
 
 void MainWindow::setBusy(bool busy) {
@@ -468,8 +658,12 @@ void MainWindow::setBusy(bool busy) {
     loadButton_->setDisabled(busy);
     clearCacheButton_->setDisabled(busy);
     clearLogsButton_->setDisabled(busy);
+    aboutButton_->setDisabled(busy);
+    exportDirEdit_->setDisabled(busy);
+    browseExportDirButton_->setDisabled(busy);
+    overwriteCheckBox_->setDisabled(busy);
     cancelButton_->setEnabled(busy);
-    for (auto it = tableWidgets_.begin(); it != tableWidgets_.end(); ++it) {
+    for (auto it = tableViews_.begin(); it != tableViews_.end(); ++it) {
         it.value()->setDisabled(busy);
     }
     progressBar_->setVisible(busy);
