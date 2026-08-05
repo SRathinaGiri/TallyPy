@@ -14,7 +14,7 @@ This project is a Python and Power BI suite for Tally XML data extraction and st
 - **Balance Sheet**: Follow Schedule 3 statutory hierarchy. Use the `Schedule3 Value` measure which handles automatic re-classification (e.g., Credit Debtors move to Liabilities).
 
 ## Key Files
-- `app1.py`: Streamlit Dashboard.
+- `tally_xml_exporter.py`: Tkinter desktop exporter with CSV-backed pagination.
 - `tally_stock_vouchers.py`: Latest robust inventory extractor.
 - `Schedule3_Implementation.md`: Reference for all DAX measures and table schemas.
 - `ClosingBalance_Audit.md`: Audit confirmation of the dynamic closing balance logic.

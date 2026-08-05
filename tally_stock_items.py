@@ -42,7 +42,7 @@ def to_float(value):
 
 # --- GET COMPANY INFO (EXACT LOGIC FROM APP1.PY) ---
 def get_company_info():
-    # Re-inserting the <TDL><TDLMESSAGE> wrappers exactly as per app1.py
+    # Re-inserting the <TDL><TDLMESSAGE> wrappers for dynamic XML TDL execution.
     xml = (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
         "<TYPE>COLLECTION</TYPE><ID>MyCompanyInfo</ID></HEADER><BODY><DESC>"

@@ -1,6 +1,6 @@
 # TallyPy: XML-Based Data Extractor & Explorer
 
-TallyPy is a robust Python-based suite designed to extract accounting and inventory data from Tally using dynamic TDL over XML. It eliminates the need for external TDL files or ODBC drivers, providing a seamless bridge between Tally and data analysis tools like Power BI and Streamlit.
+TallyPy is a robust Python-based suite designed to extract accounting and inventory data from Tally using dynamic TDL over XML. It eliminates the need for external TDL files or ODBC drivers, providing a seamless bridge between Tally and data analysis tools like Power BI, CSV, and Excel.
 
 ## 🚀 Key Features
 
@@ -8,12 +8,12 @@ TallyPy is a robust Python-based suite designed to extract accounting and invent
 - **Auto-Detection**: Automatically detects the active company name and financial period (Starting From/Ending At) from Tally.
 - **Accounting Data**: Robust extraction of Ledgers and Vouchers (Sales, Purchase, Journal, Receipt, Payment, etc.).
 - **Inventory Data**: Specialized extraction of Stock Items and Stock Vouchers, including Receipt Notes, Delivery Notes, and Stock Journals.
-- **Streamlit Dashboard**: A built-in web interface (`app1.py`) to explore, filter, and download Tally data as CSV or Excel.
+- **Python Desktop Utility**: A Tkinter interface (`tally_xml_exporter.py`) to load, preview with pagination, and export Tally data as CSV.
 - **Power BI Ready**: Optimized Python scripts designed to be used directly within Power BI's `Python.Execute` data source.
 
 ## 🛠️ Components
 
-- `app1.py`: The main Streamlit dashboard application.
+- `tally_xml_exporter.py`: The main Python desktop utility with CSV-backed pagination for large exports.
 - `tally_ledgers.py`: Extractor for Ledger masters.
 - `tally_vouchers.py`: Extractor for Accounting transactions.
 - `tally_stock_items.py`: Extractor for Stock Item masters.
@@ -40,9 +40,9 @@ TallyPy is a robust Python-based suite designed to extract accounting and invent
    pip install -r requirements.txt
    ```
 
-3. **Run the Explorer**:
+3. **Run the desktop exporter**:
    ```bash
-   streamlit run app1.py
+   python tally_xml_exporter.py
    ```
 
 ## 📊 Power BI Integration

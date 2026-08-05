@@ -1,8 +1,10 @@
 import calendar
+import csv
 import hashlib
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -571,6 +573,101 @@ def dataframe_value_counts(df, column):
     return {str(key): int(value) for key, value in counts.items()}
 
 
+class CsvBackedTable:
+    def __init__(self, path, columns, row_count=0):
+        self.path = path
+        self.columns = list(columns)
+        self.row_count = int(row_count)
+        self.offsets = self._build_offsets()
+
+    def __len__(self):
+        return self.row_count
+
+    @property
+    def empty(self):
+        return self.row_count == 0
+
+    def read_page(self, start, end):
+        rows = []
+        if not self.path or not os.path.exists(self.path) or start >= end:
+            return rows
+        if self.offsets and start < len(self.offsets):
+            return self._read_page_by_offset(start, end)
+        with open(self.path, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            next(reader, None)
+            for index, row in enumerate(reader):
+                if index < start:
+                    continue
+                if index >= end:
+                    break
+                if len(row) < len(self.columns):
+                    row = row + [""] * (len(self.columns) - len(row))
+                rows.append(row[:len(self.columns)])
+        return rows
+
+    def _build_offsets(self):
+        offsets = []
+        if not self.path or not os.path.exists(self.path):
+            return offsets
+        try:
+            with open(self.path, "r", encoding="utf-8-sig", newline="") as handle:
+                handle.readline()
+                while True:
+                    offset = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        break
+                    offsets.append(offset)
+        except OSError:
+            return []
+        return offsets
+
+    def _read_page_by_offset(self, start, end):
+        rows = []
+        with open(self.path, "r", encoding="utf-8-sig", newline="") as handle:
+            handle.seek(self.offsets[start])
+            reader = csv.reader(handle)
+            for row in reader:
+                if len(rows) >= max(0, end - start):
+                    break
+                if len(row) < len(self.columns):
+                    row = row + [""] * (len(self.columns) - len(row))
+                rows.append(row[:len(self.columns)])
+        return rows
+
+
+def create_csv_table_writer(path, columns):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    handle = open(path, "w", encoding="utf-8-sig", newline="")
+    writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="ignore")
+    writer.writeheader()
+    return handle, writer
+
+
+def normalize_export_row(row, columns, company, from_date, to_date):
+    output = dict(row)
+    output["CompanyName"] = company
+    output["FromDate"] = format_tally_date(from_date)
+    output["ToDate"] = format_tally_date(to_date)
+    normalized = {}
+    for column in columns:
+        value = output.get(column, "")
+        if value is None:
+            value = ""
+        value = str(value).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        normalized[column] = value
+    return normalized
+
+
+def write_rows_to_csv(writer, rows, columns, company, from_date, to_date):
+    count = 0
+    for row in rows:
+        writer.writerow(normalize_export_row(row, columns, company, from_date, to_date))
+        count += 1
+    return count
+
+
 def is_real_voucher(elem):
     if strip_ns(elem.tag).upper() != "VOUCHER":
         return False
@@ -1087,6 +1184,122 @@ def fetch_chunked_rows(url, company, from_date, to_date, table_name, build_reque
             log(f"{table_name}: fallback summary: {incomplete_chunks} incomplete chunk(s) were split into smaller MasterID ranges.")
         log(f"{table_name}: completed with {len(rows)} row(s).")
     return rows
+
+
+def fetch_chunked_rows_stream(url, company, from_date, to_date, table_name, build_request, parse_chunk, handle_rows, log=None, context=None, warnings=None):
+    total_rows = 0
+    chunks = plan_export_chunks(url, company, from_date, to_date, log, context, warnings)
+    if log:
+        log(f"{table_name}: starting {len(chunks)} chunk(s).")
+    incomplete_chunks = 0
+
+    def split_masterid_chunk(chunk, display_name, cause=None):
+        master_from = chunk.get("master_from")
+        master_to = chunk.get("master_to")
+        if master_from is None or master_to is None:
+            if cause:
+                raise cause
+            raise ValueError("Cannot split chunk without a MasterID range.")
+        master_from = int(master_from)
+        master_to = int(master_to)
+        if master_to - master_from <= 5:
+            message = (
+                "Voucher detail export failed for a very small MasterID range "
+                f"({master_from}-{master_to}). This usually points to Tally data health issues "
+                "or data exceptions in one of these vouchers. Resolve Tally data exceptions/rewrite data, "
+                "then retry this utility."
+            )
+            if cause:
+                raise ValueError(message) from cause
+            raise ValueError(message)
+        midpoint = (master_from + master_to) // 2
+        if log:
+            log(f"{table_name}: splitting MasterID range {master_from}-{master_to} into {master_from}-{midpoint} and {midpoint + 1}-{master_to}.")
+        left_chunk = dict(chunk)
+        left_chunk["master_to"] = midpoint
+        left_chunk["expected_count"] = None
+        right_chunk = dict(chunk)
+        right_chunk["master_from"] = midpoint + 1
+        right_chunk["expected_count"] = None
+        process_chunk(left_chunk, f"{display_name}.1")
+        process_chunk(right_chunk, f"{display_name}.2")
+
+    def process_chunk(chunk, display_name):
+        nonlocal incomplete_chunks, total_rows
+        if context:
+            context.check_cancelled()
+        detail_log = log and should_log_chunk_detail(display_name)
+        chunk_from = chunk["from_date"]
+        chunk_to = chunk["to_date"]
+        try:
+            if detail_log:
+                log(f"{table_name}: {display_name} started ({chunk_label(chunk)}).")
+            xml = fetch_xml_cached(url, build_request(company, chunk_from, chunk_to, chunk.get("master_from"), chunk.get("master_to")), company, table_name, chunk, log, context)
+            root = parse_xml_root(xml)
+            if context:
+                context.check_cancelled()
+            status = clean_text(first_descendant_text(root, "STATUS"))
+            if status == "0":
+                error_text = first_descendant_text(root, "LINEERROR") or "Tally returned STATUS=0"
+                raise ValueError(error_text)
+            detail_header_count = count_voucher_headers(root)
+            chunk_rows = parse_chunk(root, chunk_from, chunk_to)
+            expected_count = chunk.get("expected_count")
+            if chunk.get("master_from") is not None and expected_count is not None and detail_header_count and detail_header_count < expected_count:
+                raise IncompleteChunkError(
+                    f"MasterID-filtered response returned {detail_header_count} detail voucher header(s), "
+                    f"but probe saw {expected_count} voucher header(s)."
+                )
+            written = int(handle_rows(chunk_rows) or 0)
+            total_rows += written
+            if detail_log:
+                log(f"{table_name}: {display_name} parsed {len(chunk_rows)} row(s) from {detail_header_count} voucher header(s). Total rows: {total_rows}.")
+        except IncompleteChunkError as exc:
+            incomplete_chunks += 1
+            if detail_log:
+                log(f"{table_name}: {display_name} incomplete: {exc}")
+                if remove_cached_chunk(company, table_name, chunk):
+                    log(f"{table_name}: removed incomplete cached MasterID response for {chunk_label(chunk)}.")
+            else:
+                remove_cached_chunk(company, table_name, chunk)
+            split_masterid_chunk(chunk, display_name)
+        except ExportCancelled:
+            raise
+        except Exception as exc:
+            if log:
+                log(f"{table_name}: {display_name} failed: {exc}")
+            master_from = chunk.get("master_from")
+            master_to = chunk.get("master_to")
+            if master_from is not None and master_to is not None:
+                split_masterid_chunk(chunk, display_name, exc)
+                return
+            start_date = parse_tally_date_value(chunk_from)
+            end_date = parse_tally_date_value(chunk_to)
+            if start_date and end_date and start_date < end_date:
+                if log:
+                    log(f"{table_name}: splitting failed chunk into daily requests.")
+                for day_start, day_end in split_period(start_date, end_date, "daily"):
+                    if context:
+                        context.check_cancelled()
+                    day_from = day_start.strftime("%Y%m%d")
+                    day_to = day_end.strftime("%Y%m%d")
+                    day_chunk = make_date_chunk(day_from, day_to)
+                    xml = fetch_xml_cached(url, build_request(company, day_from, day_to, None, None), company, table_name, day_chunk, log, context)
+                    day_rows = parse_chunk(parse_xml_root(xml), day_from, day_to)
+                    written = int(handle_rows(day_rows) or 0)
+                    total_rows += written
+                    if log:
+                        log(f"{table_name}: daily chunk {format_tally_date(day_from)} parsed {len(day_rows)} row(s). Total rows: {total_rows}.")
+            else:
+                raise
+
+    for index, chunk in enumerate(chunks, start=1):
+        process_chunk(chunk, f"chunk {index}/{len(chunks)}")
+    if log:
+        if incomplete_chunks:
+            log(f"{table_name}: fallback summary: {incomplete_chunks} incomplete chunk(s) were split into smaller MasterID ranges.")
+        log(f"{table_name}: completed with {total_rows} row(s).")
+    return total_rows
 
 
 def build_ledger_request_xml(company):
@@ -1682,6 +1895,164 @@ def load_tally_data(host, port, company, from_date, to_date, log=None, context=N
     }
 
 
+def load_tally_data_csv_backed(host, port, company, from_date, to_date, log=None, context=None):
+    load_started = time.perf_counter()
+    warnings = []
+    url = f"http://{host}:{port}"
+    selected_company = clean_text(company)
+    from_date = clean_text(from_date)
+    to_date = clean_text(to_date)
+    session_dir = tempfile.mkdtemp(prefix="tally_xml_export_")
+    if log:
+        log(f"Load started. Target: {url}. CSV workspace: {session_dir}.")
+    if context:
+        context.check_cancelled()
+
+    if not selected_company or not from_date or not to_date:
+        if log:
+            log("Company/date input incomplete; requesting active company metadata.")
+        cmp_name, cmp_start, cmp_end = get_company_info(host, port, context)
+        if not selected_company:
+            selected_company = cmp_name
+        if not from_date:
+            from_date = cmp_start
+        if not to_date:
+            to_date = cmp_end
+
+    if log:
+        log(f"Using company='{selected_company}', period={format_tally_date(from_date)} to {format_tally_date(to_date)}.")
+        log("Running best-effort Tally data exception preflight.")
+    exception_report, exception_summary = check_tally_data_exceptions(url, selected_company, log, context)
+    if exception_report:
+        raise ValueError(
+            "Tally data exceptions appear to exist in "
+            f"'{exception_report}'. Resolve Tally data exceptions before running voucher export. "
+            f"Details: {exception_summary}"
+        )
+
+    if log:
+        log("Fetching voucher type and group metadata.")
+    started = time.perf_counter()
+    vtype_map, group_map = fetch_tally_metadata(url, selected_company, context)
+    if log:
+        log(f"Metadata received in {time.perf_counter() - started:.1f}s. Voucher types: {len(vtype_map)}. Groups: {len(group_map)}.")
+
+    paths = {
+        "voucher_df": os.path.join(session_dir, "vouchers.csv"),
+        "all_voucher_df": os.path.join(session_dir, "allvouchers.csv"),
+        "ledger_df": os.path.join(session_dir, "ledgers.csv"),
+        "stock_item_df": os.path.join(session_dir, "stock_items.csv"),
+        "inventory_df": os.path.join(session_dir, "stock_vouchers.csv"),
+    }
+    handles = []
+    try:
+        voucher_handle, voucher_writer = create_csv_table_writer(paths["voucher_df"], VOUCHER_COLUMNS)
+        all_voucher_handle, all_voucher_writer = create_csv_table_writer(paths["all_voucher_df"], ALL_VOUCHER_COLUMNS)
+        ledger_handle, ledger_writer = create_csv_table_writer(paths["ledger_df"], LEDGER_COLUMNS)
+        stock_item_handle, stock_item_writer = create_csv_table_writer(paths["stock_item_df"], STOCK_ITEM_COLUMNS)
+        inventory_handle, inventory_writer = create_csv_table_writer(paths["inventory_df"], STOCK_VOUCHER_COLUMNS)
+        handles = [voucher_handle, all_voucher_handle, ledger_handle, stock_item_handle, inventory_handle]
+
+        if log:
+            log("Fetching ledgers.")
+        started = time.perf_counter()
+        ledger_root = parse_xml_root(post_to_tally(url, build_ledger_request_xml(selected_company), context=context))
+        ledger_rows = parse_ledgers(ledger_root, group_map)
+        ledger_meta = {row["Name"]: row for row in ledger_rows}
+        ledger_count = write_rows_to_csv(ledger_writer, ledger_rows, LEDGER_COLUMNS, selected_company, from_date, to_date)
+        if log:
+            log(f"Ledgers parsed in {time.perf_counter() - started:.1f}s. Rows: {ledger_count}.")
+
+        if log:
+            log("Fetching accounting/all voucher rows with Tally-side flat ledger-entry TDL and probe-based chunking.")
+        voucher_diagnostics = create_voucher_diagnostics()
+        voucher_count = 0
+
+        def handle_voucher_rows(rows):
+            nonlocal voucher_count
+            all_count = write_rows_to_csv(all_voucher_writer, rows, ALL_VOUCHER_COLUMNS, selected_company, from_date, to_date)
+            accounting_rows = [row for row in rows if row.get("VoucherCategory") == "Accounting"]
+            voucher_count += write_rows_to_csv(voucher_writer, accounting_rows, VOUCHER_COLUMNS, selected_company, from_date, to_date)
+            return all_count
+
+        all_voucher_count = fetch_chunked_rows_stream(
+            url,
+            selected_company,
+            from_date,
+            to_date,
+            "vouchers_flat",
+            build_flat_voucher_request_xml,
+            lambda root, chunk_from, chunk_to: parse_flat_vouchers(root, ledger_meta, selected_company, chunk_from, chunk_to, vtype_map, voucher_diagnostics),
+            handle_voucher_rows,
+            log,
+            context,
+            warnings,
+        )
+        voucher_diagnostic_summary = finalize_voucher_diagnostics(voucher_diagnostics)
+
+        if log:
+            log("Fetching stock items.")
+        started = time.perf_counter()
+        stock_item_root = parse_xml_root(post_to_tally(url, build_stock_item_request_xml(selected_company), context=context))
+        stock_item_rows = parse_stock_items(stock_item_root)
+        stock_item_count = write_rows_to_csv(stock_item_writer, stock_item_rows, STOCK_ITEM_COLUMNS, selected_company, from_date, to_date)
+        if log:
+            log(f"Stock items parsed in {time.perf_counter() - started:.1f}s. Rows: {stock_item_count}.")
+
+        if log:
+            log("Fetching stock voucher rows with Tally-side flat inventory-entry TDL and probe-based chunking.")
+        inventory_count = fetch_chunked_rows_stream(
+            url,
+            selected_company,
+            from_date,
+            to_date,
+            "inventory_flat",
+            build_flat_inventory_entries_request_xml,
+            lambda root, chunk_from, chunk_to: parse_flat_inventory_entries(root, selected_company),
+            lambda rows: write_rows_to_csv(inventory_writer, rows, STOCK_VOUCHER_COLUMNS, selected_company, from_date, to_date),
+            log,
+            context,
+            warnings,
+        )
+    except Exception:
+        for handle in handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        shutil.rmtree(session_dir, ignore_errors=True)
+        raise
+    finally:
+        for handle in handles:
+            try:
+                handle.flush()
+                handle.close()
+            except Exception:
+                pass
+
+    if log:
+        log(
+            "Load completed in "
+            f"{time.perf_counter() - load_started:.1f}s. "
+            f"Accounting voucher rows: {voucher_count}. All voucher rows: {all_voucher_count}. "
+            f"Ledgers: {ledger_count}. Stock items: {stock_item_count}. Stock vouchers: {inventory_count}."
+        )
+
+    return {
+        "company_name": selected_company,
+        "from_date": from_date,
+        "to_date": to_date,
+        "voucher_df": CsvBackedTable(paths["voucher_df"], VOUCHER_COLUMNS, voucher_count),
+        "all_voucher_df": CsvBackedTable(paths["all_voucher_df"], ALL_VOUCHER_COLUMNS, all_voucher_count),
+        "ledger_df": CsvBackedTable(paths["ledger_df"], LEDGER_COLUMNS, ledger_count),
+        "stock_item_df": CsvBackedTable(paths["stock_item_df"], STOCK_ITEM_COLUMNS, stock_item_count),
+        "inventory_df": CsvBackedTable(paths["inventory_df"], STOCK_VOUCHER_COLUMNS, inventory_count),
+        "warnings": warnings,
+        "voucher_diagnostics": voucher_diagnostic_summary,
+        "session_dir": session_dir,
+    }
+
+
 class TallyDesktopApp:
     def __init__(self, root):
         self.root = root
@@ -1693,20 +2064,25 @@ class TallyDesktopApp:
         self.to_date_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
         self.stats_var = tk.StringVar(value="Voucher Rows: 0 | All Voucher Rows: 0 | Ledgers: 0 | Stock Items: 0 | Stock Voucher Rows: 0")
+        self.export_dir_var = tk.StringVar()
+        self.overwrite_var = tk.BooleanVar(value=False)
 
         self.tables = {
-            "voucher_df": pd.DataFrame(columns=VOUCHER_COLUMNS),
-            "all_voucher_df": pd.DataFrame(columns=ALL_VOUCHER_COLUMNS),
-            "ledger_df": pd.DataFrame(columns=LEDGER_COLUMNS),
-            "stock_item_df": pd.DataFrame(columns=STOCK_ITEM_COLUMNS),
-            "inventory_df": pd.DataFrame(columns=STOCK_VOUCHER_COLUMNS),
+            "voucher_df": CsvBackedTable("", VOUCHER_COLUMNS, 0),
+            "all_voucher_df": CsvBackedTable("", ALL_VOUCHER_COLUMNS, 0),
+            "ledger_df": CsvBackedTable("", LEDGER_COLUMNS, 0),
+            "stock_item_df": CsvBackedTable("", STOCK_ITEM_COLUMNS, 0),
+            "inventory_df": CsvBackedTable("", STOCK_VOUCHER_COLUMNS, 0),
         }
 
         self.treeviews = {}
+        self.page_state = {}
         self.log_file_path = self._create_log_file_path()
         self.current_context = None
+        self.current_session_dir = None
         self.is_closing = False
         self._build_ui()
+        self._load_export_settings()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log(f"Log file: {self.log_file_path}")
 
@@ -1715,6 +2091,43 @@ class TallyDesktopApp:
         os.makedirs(log_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return os.path.join(log_dir, f"tally_xml_exporter_{stamp}.log")
+
+    def _settings_file_path(self):
+        settings_dir = os.path.join(os.getcwd(), ".tally_settings")
+        os.makedirs(settings_dir, exist_ok=True)
+        return os.path.join(settings_dir, "desktop_exporter_settings.txt")
+
+    def _load_export_settings(self):
+        try:
+            path = self._settings_file_path()
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = [line.rstrip("\n") for line in handle]
+            if lines:
+                self.export_dir_var.set(lines[0])
+            if len(lines) > 1:
+                self.overwrite_var.set(lines[1].strip().lower() in {"1", "true", "yes"})
+        except OSError:
+            pass
+
+    def _save_export_settings(self):
+        try:
+            with open(self._settings_file_path(), "w", encoding="utf-8") as handle:
+                handle.write(f"{self.export_dir_var.get().strip()}\n")
+                handle.write("1\n" if self.overwrite_var.get() else "0\n")
+        except OSError:
+            pass
+
+    def choose_export_directory(self):
+        folder = filedialog.askdirectory(initialdir=self.export_dir_var.get().strip() or os.getcwd())
+        if not folder:
+            return
+        self.export_dir_var.set(folder)
+        self._save_export_settings()
+
+    def _default_export_directory(self):
+        return self.export_dir_var.get().strip()
 
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
@@ -1783,8 +2196,19 @@ class TallyDesktopApp:
         ttk.Entry(details, textvariable=self.status_var, state="readonly", width=36).grid(row=3, column=1, sticky="ew", pady=2)
         ttk.Label(details, textvariable=self.stats_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 4))
 
+        ttk.Label(details, text="Export Folder").grid(row=5, column=0, sticky="w")
+        export_dir_row = ttk.Frame(details)
+        export_dir_row.grid(row=5, column=1, sticky="ew", pady=2)
+        export_dir_row.columnconfigure(0, weight=1)
+        self.export_dir_entry = ttk.Entry(export_dir_row, textvariable=self.export_dir_var, width=36)
+        self.export_dir_entry.grid(row=0, column=0, sticky="ew")
+        self.browse_export_dir_button = ttk.Button(export_dir_row, text="Browse", command=self.choose_export_directory)
+        self.browse_export_dir_button.grid(row=0, column=1, padx=(6, 0))
+        self.export_dir_entry.bind("<FocusOut>", lambda _event: self._save_export_settings())
+        ttk.Checkbutton(details, text="Overwrite existing files", variable=self.overwrite_var, command=self._save_export_settings).grid(row=6, column=1, sticky="w", pady=(0, 4))
+
         export_row = ttk.Frame(details)
-        export_row.grid(row=5, column=0, columnspan=2, sticky="ew")
+        export_row.grid(row=7, column=0, columnspan=2, sticky="ew")
         ttk.Button(export_row, text="Export All CSVs", command=self.export_all_csvs).pack(side="left")
         ttk.Button(export_row, text="Export Vouchers", command=lambda: self.export_single_csv("voucher_df", "vouchers.csv")).pack(side="left", padx=4)
         ttk.Button(export_row, text="Export All Vouchers", command=lambda: self.export_single_csv("all_voucher_df", "allvouchers.csv")).pack(side="left", padx=4)
@@ -1814,17 +2238,46 @@ class TallyDesktopApp:
         ]:
             frame = ttk.Frame(notebook, padding=6)
             notebook.add(frame, text=title)
-            frame.rowconfigure(0, weight=1)
+            frame.rowconfigure(1, weight=1)
             frame.columnconfigure(0, weight=1)
+
+            pager = ttk.Frame(frame)
+            pager.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+            first_button = ttk.Button(pager, text="First", command=lambda table_key=key: self._set_table_page(table_key, 0))
+            prev_button = ttk.Button(pager, text="Previous", command=lambda table_key=key: self._move_table_page(table_key, -1))
+            next_button = ttk.Button(pager, text="Next", command=lambda table_key=key: self._move_table_page(table_key, 1))
+            last_button = ttk.Button(pager, text="Last", command=lambda table_key=key: self._set_table_page(table_key, "last"))
+            page_size_var = tk.StringVar(value="500")
+            page_size = ttk.Combobox(pager, textvariable=page_size_var, values=("100", "250", "500", "1000", "2000"), width=6, state="readonly")
+            page_label = ttk.Label(pager, text="Rows 0-0 of 0")
+
+            first_button.pack(side="left")
+            prev_button.pack(side="left", padx=(4, 0))
+            next_button.pack(side="left", padx=(4, 0))
+            last_button.pack(side="left", padx=(4, 10))
+            ttk.Label(pager, text="Page size").pack(side="left")
+            page_size.pack(side="left", padx=(4, 10))
+            page_label.pack(side="left")
+            page_size.bind("<<ComboboxSelected>>", lambda _event, table_key=key: self._set_table_page(table_key, 0))
+
             tree = ttk.Treeview(frame, show="headings")
             vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
             hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
             tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-            tree.grid(row=0, column=0, sticky="nsew")
-            vsb.grid(row=0, column=1, sticky="ns")
-            hsb.grid(row=1, column=0, sticky="ew")
+            tree.grid(row=1, column=0, sticky="nsew")
+            vsb.grid(row=1, column=1, sticky="ns")
+            hsb.grid(row=2, column=0, sticky="ew")
             self._configure_tree(tree, columns)
             self.treeviews[key] = tree
+            self.page_state[key] = {
+                "page": 0,
+                "page_size_var": page_size_var,
+                "label": page_label,
+                "first": first_button,
+                "previous": prev_button,
+                "next": next_button,
+                "last": last_button,
+            }
 
         self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
         self.log_text.pack(fill="both", expand=True)
@@ -1904,6 +2357,8 @@ class TallyDesktopApp:
         self.load_button.configure(state=state)
         self.clear_cache_button.configure(state=state)
         self.clear_logs_button.configure(state=state)
+        self.export_dir_entry.configure(state=state)
+        self.browse_export_dir_button.configure(state=state)
         self.cancel_button.configure(state="normal" if busy else "disabled")
         if busy:
             self.progress.start(10)
@@ -1920,7 +2375,13 @@ class TallyDesktopApp:
     def _on_close(self):
         self.is_closing = True
         self.cancel_current_operation()
+        self._cleanup_current_session()
         self.root.destroy()
+
+    def _cleanup_current_session(self):
+        if self.current_session_dir:
+            shutil.rmtree(self.current_session_dir, ignore_errors=True)
+            self.current_session_dir = None
 
     def _run_background(self, target):
         self._set_busy(True)
@@ -1967,7 +2428,7 @@ class TallyDesktopApp:
                 company = self.company_entry.get().strip()
                 from_date = self.from_entry.get().strip()
                 to_date = self.to_entry.get().strip()
-                data = load_tally_data(host, port, company, from_date, to_date, log=self._log_from_worker, context=context)
+                data = load_tally_data_csv_backed(host, port, company, from_date, to_date, log=self._log_from_worker, context=context)
                 self._call_ui(lambda: self._apply_loaded_data(data))
             except ExportCancelled as exc:
                 message = str(exc)
@@ -1988,13 +2449,15 @@ class TallyDesktopApp:
         self._run_background(work)
 
     def _apply_loaded_data(self, data):
+        old_session_dir = self.current_session_dir
+        self.current_session_dir = data.get("session_dir")
         self.company_var.set(data["company_name"])
         self.from_date_var.set(format_tally_date(data["from_date"]))
         self.to_date_var.set(format_tally_date(data["to_date"]))
 
         for key in self.tables:
             self.tables[key] = data[key]
-            self._populate_tree(self.treeviews[key], data[key])
+            self._set_table_page(key, 0)
 
         self.stats_var.set(
             f"Voucher Rows: {len(data['voucher_df'])} | All Voucher Rows: {len(data['all_voucher_df'])} | Ledgers: {len(data['ledger_df'])} | "
@@ -2016,14 +2479,58 @@ class TallyDesktopApp:
             messagebox.showwarning("Tally Data Warning", warning_text)
         else:
             self._set_status(f"Loaded data for {data['company_name']}")
+        if old_session_dir and old_session_dir != self.current_session_dir:
+            shutil.rmtree(old_session_dir, ignore_errors=True)
 
-    def _populate_tree(self, tree, df):
-        tree.delete(*tree.get_children())
-        if df.empty:
+    def _page_size_for(self, key):
+        try:
+            return max(1, int(self.page_state[key]["page_size_var"].get()))
+        except Exception:
+            return 500
+
+    def _page_count_for(self, key):
+        total = len(self.tables[key])
+        page_size = self._page_size_for(key)
+        return max(1, (total + page_size - 1) // page_size)
+
+    def _set_table_page(self, key, page):
+        if key not in self.tables or key not in self.treeviews:
             return
-        preview = df.head(500).fillna("")
-        for row in preview.itertuples(index=False, name=None):
+        page_count = self._page_count_for(key)
+        target = page_count - 1 if page == "last" else int(page)
+        target = max(0, min(target, page_count - 1))
+        self.page_state[key]["page"] = target
+        self._populate_tree_page(key)
+
+    def _move_table_page(self, key, delta):
+        current = self.page_state.get(key, {}).get("page", 0)
+        self._set_table_page(key, current + delta)
+
+    def _populate_tree_page(self, key):
+        tree = self.treeviews[key]
+        table = self.tables[key]
+        state = self.page_state[key]
+        tree.delete(*tree.get_children())
+        total = len(table)
+        if total == 0:
+            state["label"].configure(text="Rows 0-0 of 0")
+            for button_name in ("first", "previous", "next", "last"):
+                state[button_name].configure(state="disabled")
+            return
+
+        page_size = self._page_size_for(key)
+        page_count = self._page_count_for(key)
+        page = max(0, min(state.get("page", 0), page_count - 1))
+        state["page"] = page
+        start = page * page_size
+        end = min(start + page_size, total)
+        for row in table.read_page(start, end):
             tree.insert("", "end", values=row)
+        state["label"].configure(text=f"Rows {start + 1}-{end} of {total} | Page {page + 1} of {page_count}")
+        state["first"].configure(state="normal" if page > 0 else "disabled")
+        state["previous"].configure(state="normal" if page > 0 else "disabled")
+        state["next"].configure(state="normal" if page + 1 < page_count else "disabled")
+        state["last"].configure(state="normal" if page + 1 < page_count else "disabled")
 
     def _require_data(self):
         if all(df.empty for df in self.tables.values()):
@@ -2031,25 +2538,47 @@ class TallyDesktopApp:
             return False
         return True
 
+    def _write_csv_checked(self, table, path):
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        if os.path.exists(path) and not self.overwrite_var.get():
+            raise FileExistsError(f"File already exists and overwrite is disabled: {path}")
+        if isinstance(table, CsvBackedTable):
+            if os.path.abspath(table.path) == os.path.abspath(path):
+                return
+            if os.path.exists(path):
+                os.remove(path)
+            shutil.copyfile(table.path, path)
+        else:
+            table.to_csv(path, index=False, encoding="utf-8-sig")
+
     def export_single_csv(self, key, default_name):
         if self.tables[key].empty:
             messagebox.showwarning("No data", "This table is empty.")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv")],
-            initialfile=default_name,
-        )
-        if not path:
-            return
-        self.tables[key].to_csv(path, index=False, encoding="utf-8-sig")
-        self._set_status(f"Saved {os.path.basename(path)}")
-        messagebox.showinfo("Export complete", f"Saved:\n{path}")
+        export_dir = self._default_export_directory()
+        if export_dir:
+            path = os.path.join(export_dir, default_name)
+        else:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+                initialfile=default_name,
+            )
+            if not path:
+                return
+        try:
+            self._write_csv_checked(self.tables[key], path)
+            self._set_status(f"Saved {os.path.basename(path)}")
+            messagebox.showinfo("Export complete", f"Saved:\n{path}")
+        except Exception as exc:
+            self._handle_error(f"Export failed: {exc}")
 
     def export_all_csvs(self):
         if not self._require_data():
             return
-        folder = filedialog.askdirectory()
+        folder = self._default_export_directory() or filedialog.askdirectory()
         if not folder:
             return
 
@@ -2060,8 +2589,14 @@ class TallyDesktopApp:
             "stock_item_df": "stock_items.csv",
             "inventory_df": "stock_vouchers.csv",
         }
-        for key, filename in file_map.items():
-            self.tables[key].to_csv(os.path.join(folder, filename), index=False, encoding="utf-8-sig")
+        try:
+            for key, filename in file_map.items():
+                if self.tables[key].empty:
+                    continue
+                self._write_csv_checked(self.tables[key], os.path.join(folder, filename))
+        except Exception as exc:
+            self._handle_error(f"Export failed: {exc}")
+            return
 
         self._set_status(f"Exported all CSVs to {folder}")
         messagebox.showinfo("Export complete", f"All CSVs saved to:\n{folder}")

@@ -1,6 +1,6 @@
 # Tally Qt Exporter
 
-Native Qt Widgets desktop app for exporting Tally data to CSV using the same XML request and parsing flow as `app1.py`.
+Native Qt Widgets desktop app for exporting Tally data to CSV using the same XML request and parsing flow as the Python exporter.
 
 Current release version: `0.1.5`
 
