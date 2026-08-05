@@ -129,7 +129,7 @@ def fetch_xml_cached(url, xml_text, company, table_name, from_date, to_date):
     if os.environ.get("TALLYXML_DISABLE_CACHE") == "1":
         return post_to_tally(url, xml_text)
     cache_root = os.path.join(os.getcwd(), ".tally_cache")
-    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), "xml-v2"])
+    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), "xml-v3"])
     path = os.path.join(cache_root, hashlib.sha1(key_text.encode("utf-8", errors="ignore")).hexdigest() + ".xml")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -190,7 +190,7 @@ F_FROM = format_tally_date(RAW_FROM)
 F_TO = format_tally_date(RAW_TO)
 
 rows = []
-def build_inventory_request_xml(company, from_date, to_date):
+def build_flat_inventory_request_xml(company, from_date, to_date):
     static_vars = [
         "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
         f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE>",
@@ -200,74 +200,57 @@ def build_inventory_request_xml(company, from_date, to_date):
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
-        "<TYPE>COLLECTION</TYPE><ID>MyInventoryVouchers</ID></HEADER><BODY><DESC>"
+        "<TYPE>COLLECTION</TYPE><ID>TXMLFlatInventoryRows</ID></HEADER><BODY><DESC>"
         f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        "<COLLECTION NAME=\"MyInventoryVouchers\"><TYPE>Voucher</TYPE>"
-        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, "
-        "InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH>"
+        "<COLLECTION NAME=\"TXMLBaseInventoryVouchers\"><TYPE>Voucher</TYPE>"
+        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration</FETCH>"
+        "</COLLECTION>"
+        "<COLLECTION NAME=\"TXMLFlatInventoryRows\"><SOURCECOLLECTION>TXMLBaseInventoryVouchers</SOURCECOLLECTION>"
+        "<WALK>All Inventory Entries</WALK>"
+        "<FETCH>StockItemName, BilledQty, Rate, Amount, TXMLDate, TXMLVoucherTypeName, TXMLVoucherNumber, "
+        "TXMLVoucherNarration, TXMLCompanyName, TXMLSignedQty, TXMLSignedAmount, TXMLGodownName, TXMLBatchName</FETCH>"
+        "<COMPUTE>TXMLDate:$..Date</COMPUTE>"
+        "<COMPUTE>TXMLVoucherTypeName:$..VoucherTypeName</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNumber:$..VoucherNumber</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
+        "<COMPUTE>TXMLCompanyName:##SVCurrentCompany</COMPUTE>"
+        "<COMPUTE>TXMLSignedQty:If $IsDeemedPositive Then $$Abs:$BilledQty Else $$Abs:$BilledQty * -1</COMPUTE>"
+        "<COMPUTE>TXMLSignedAmount:If $IsDeemedPositive Then $$Abs:$Amount Else $$Abs:$Amount * -1</COMPUTE>"
+        "<COMPUTE>TXMLGodownName:$GodownName</COMPUTE>"
+        "<COMPUTE>TXMLBatchName:$BatchName</COMPUTE>"
         "</COLLECTION>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
 
-def append_inventory_rows(root):
-    for voucher in root.iter():
-        if strip_ns(voucher.tag).upper() != "VOUCHER":
+def append_flat_inventory_rows(root):
+    before = len(rows)
+    for inv in root.iter():
+        if strip_ns(inv.tag).upper() != "INVENTORYENTRY":
             continue
-        v_type = direct_child_text(voucher, "VOUCHERTYPENAME")
-        if "Order" in v_type: continue
-        
-        v_date = format_tally_date(direct_child_text(voucher, "DATE"))
-        v_number = direct_child_text(voucher, "VOUCHERNUMBER")
-        v_narration = clean_text(voucher.findtext("NARRATION") or voucher.findtext("VOUCHERNARRATION"))
-
-        # Greedy search exactly from app1.py
-        inv_nodes = [child for child in voucher if "INVENTORYENTRIES" in child.tag.upper()]
-
-        for inv in inv_nodes:
-            item_name = direct_child_text(inv, "STOCKITEMNAME")
-            if not item_name: continue
-            
-            is_pos_val = direct_child_text(inv, "ISDEEMEDPOSITIVE")
-            is_inward = (is_pos_val.upper() == "YES")
-
-            amount_val = abs(to_float(direct_child_text(inv, "AMOUNT")))
-            qty_val = abs(to_float(direct_child_text(inv, "BILLEDQTY")))
-            rate_val = to_float(direct_child_text(inv, "RATE"))
-            
-            batch_nodes = [c for c in inv if strip_ns(c.tag).upper() == "BATCHALLOCATIONS.LIST"]
-            godown = direct_child_text(batch_nodes[0], "GODOWNNAME") if batch_nodes else ""
-            batch = direct_child_text(batch_nodes[0], "BATCHNAME") if batch_nodes else ""
-
-            rows.append({
-                "Date": v_date,
-                "VoucherTypeName": v_type,
-                "VoucherNumber": v_number,
-                "StockItemName": item_name,
-                "BilledQty": qty_val if is_inward else -qty_val,
-                "Rate": rate_val,
-                "Amount": amount_val if is_inward else -amount_val,
-                "GodownName": godown,
-                "BatchName": batch,
-                "VoucherNarration": v_narration,
-                "CompanyName": COMPANY_NAME,
-                "FromDate": F_FROM,
-                "ToDate": F_TO,
-            })
+        item_name = direct_child_text(inv, "STOCKITEMNAME")
+        v_type = direct_child_text(inv, "TXMLVOUCHERTYPENAME")
+        if not item_name or "Order" in v_type:
+            continue
+        rows.append({
+            "Date": format_tally_date(direct_child_text(inv, "TXMLDATE")),
+            "VoucherTypeName": v_type,
+            "VoucherNumber": direct_child_text(inv, "TXMLVOUCHERNUMBER"),
+            "StockItemName": clean_text(item_name),
+            "BilledQty": to_float(direct_child_text(inv, "TXMLSIGNEDQTY")),
+            "Rate": to_float(direct_child_text(inv, "RATE")),
+            "Amount": to_float(direct_child_text(inv, "TXMLSIGNEDAMOUNT")),
+            "GodownName": direct_child_text(inv, "TXMLGODOWNNAME"),
+            "BatchName": direct_child_text(inv, "TXMLBATCHNAME"),
+            "VoucherNarration": direct_child_text(inv, "TXMLVOUCHERNARRATION"),
+            "CompanyName": direct_child_text(inv, "TXMLCOMPANYNAME") or COMPANY_NAME,
+            "FromDate": F_FROM,
+            "ToDate": F_TO,
+        })
+    return len(rows) - before
 
 for chunk_from, chunk_to in plan_export_chunks(URL, COMPANY_NAME, RAW_FROM, RAW_TO):
-    try:
-        xml = fetch_xml_cached(URL, build_inventory_request_xml(COMPANY_NAME, chunk_from, chunk_to), COMPANY_NAME, "inventory", chunk_from, chunk_to)
-        append_inventory_rows(ET.fromstring(xml_cleanup(xml).encode("utf-8")))
-    except Exception:
-        start_date = parse_tally_date_value(chunk_from)
-        end_date = parse_tally_date_value(chunk_to)
-        if not start_date or not end_date or start_date >= end_date:
-            raise
-        for day_start, day_end in split_period(start_date, end_date, "daily"):
-            day_from = day_start.strftime("%Y%m%d")
-            day_to = day_end.strftime("%Y%m%d")
-            xml = fetch_xml_cached(URL, build_inventory_request_xml(COMPANY_NAME, day_from, day_to), COMPANY_NAME, "inventory", day_from, day_to)
-            append_inventory_rows(ET.fromstring(xml_cleanup(xml).encode("utf-8")))
+    xml = fetch_xml_cached(URL, build_flat_inventory_request_xml(COMPANY_NAME, chunk_from, chunk_to), COMPANY_NAME, "inventory_flat", chunk_from, chunk_to)
+    append_flat_inventory_rows(ET.fromstring(xml_cleanup(xml).encode("utf-8")))
 
 StockVoucher = pd.DataFrame(rows)

@@ -334,7 +334,7 @@ def fetch_xml_cached(url, xml_text, company, table_name, from_date, to_date):
     if os.environ.get("TALLYXML_DISABLE_CACHE") == "1":
         return post_to_tally(url, xml_text)
     cache_root = os.path.join(os.getcwd(), ".tally_cache")
-    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), "xml-v2"])
+    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), "xml-v3"])
     path = os.path.join(cache_root, hashlib.sha1(key_text.encode("utf-8", errors="ignore")).hexdigest() + ".xml")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -353,18 +353,31 @@ def fetch_xml_cached(url, xml_text, company, table_name, from_date, to_date):
     raise last_error
 
 
-def build_voucher_request_xml(company, from_date, to_date):
+def build_flat_voucher_request_xml(company, from_date, to_date):
     return (
-        f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER>"
+        f"<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST><TYPE>COLLECTION</TYPE><ID>TXMLFlatVoucherRows</ID></HEADER>"
         f"<BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>"
         f"<SVFROMDATE TYPE='Date'>{escape(tally_request_date(from_date))}</SVFROMDATE><SVTODATE TYPE='Date'>{escape(tally_request_date(to_date))}</SVTODATE></STATICVARIABLES>"
-        f"<TDL><TDLMESSAGE><OBJECT NAME=\"All Ledger Entries\">"
-        f"<COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
-        f"<COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
-        f"<COMPUTE>EntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
-        f"<COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
-        f"</OBJECT><COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
-        f"<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
+        f"<TDL><TDLMESSAGE><COLLECTION NAME=\"TXMLBaseVouchers\"><TYPE>Voucher</TYPE>"
+        f"<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional</FETCH></COLLECTION>"
+        f"<COLLECTION NAME=\"TXMLFlatVoucherRows\"><SOURCECOLLECTION>TXMLBaseVouchers</SOURCECOLLECTION><WALK>All Ledger Entries</WALK>"
+        f"<FETCH>LedgerName, Amount, IsDeemedPositive, TXMLDate, TXMLVoucherTypeName, TXMLVoucherNumber, TXMLPartyLedgerName, TXMLPartyGSTIN, TXMLVoucherNarration, TXMLSignedAmount, TXMLDebitAmount, TXMLCreditAmount, TXMLDrCr, TXMLEntryLedgerMasterID, TXMLEntryParentLedger, TXMLEntryPrimaryGroup, TXMLEntryLedgerGSTIN, TXMLStatusOptional, TXMLCompanyName</FETCH>"
+        f"<COMPUTE>TXMLDate:$..Date</COMPUTE>"
+        f"<COMPUTE>TXMLVoucherTypeName:$..VoucherTypeName</COMPUTE>"
+        f"<COMPUTE>TXMLVoucherNumber:$..VoucherNumber</COMPUTE>"
+        f"<COMPUTE>TXMLPartyLedgerName:If NOT $$IsEmpty:$..PartyLedgerName Then $..PartyLedgerName Else \"N/A\"</COMPUTE>"
+        f"<COMPUTE>TXMLPartyGSTIN:$..PartyGSTIN</COMPUTE>"
+        f"<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
+        f"<COMPUTE>TXMLSignedAmount:If $IsDeemedPositive Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
+        f"<COMPUTE>TXMLDebitAmount:If $IsDeemedPositive Then $$Abs:$Amount Else 0</COMPUTE>"
+        f"<COMPUTE>TXMLCreditAmount:If $IsDeemedPositive Then 0 Else $$Abs:$Amount</COMPUTE>"
+        f"<COMPUTE>TXMLDrCr:If $IsDeemedPositive Then \"Dr\" Else \"Cr\"</COMPUTE>"
+        f"<COMPUTE>TXMLEntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
+        f"<COMPUTE>TXMLEntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
+        f"<COMPUTE>TXMLEntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
+        f"<COMPUTE>TXMLEntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
+        f"<COMPUTE>TXMLStatusOptional:If $..IsOptional Then \"Yes\" Else \"No\"</COMPUTE>"
+        f"<COMPUTE>TXMLCompanyName:##SVCurrentCompany</COMPUTE>"
         f"</COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
 
@@ -488,59 +501,70 @@ def parse_ledgers(root, group_map):
     return {row["Name"]: row for row in ledger_rows}
 
 
-def parse_voucher_rows(root, ledger_meta, company, from_date, to_date, vtype_map):
+def parse_flat_voucher_rows(root, ledger_meta, company, from_date, to_date, vtype_map):
     rows = []
     formatted_from_date = format_tally_date(from_date)
     formatted_to_date = format_tally_date(to_date)
 
-    for voucher in root.iter():
-        if strip_ns(voucher.tag).upper() != "VOUCHER":
+    for elem in root.iter():
+        ledger_name = direct_child_text(elem, "LEDGERNAME")
+        amount_value = to_decimal(first_non_empty_text(elem, ["TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT", "AMOUNT"]))
+        if not ledger_name or amount_value == 0:
             continue
 
-        voucher_type = canonical_voucher_type_name(direct_child_text(voucher, "VOUCHERTYPENAME"))
+        voucher_type = canonical_voucher_type_name(first_non_empty_text(elem, ["TXMLVOUCHERTYPENAME", "VOUCHERTYPENAME"]))
         base_voucher_type = canonical_voucher_type_name(vtype_map.get(voucher_type, voucher_type))
         voucher_category = voucher_category_from_base_type(base_voucher_type)
-        voucher_date = format_tally_date(direct_child_text(voucher, "DATE"))
-        voucher_number = direct_child_text(voucher, "VOUCHERNUMBER")
-        voucher_narration = first_non_empty_text(voucher, ["NARRATION", "VOUCHERNARRATION"])
+        base_amount = abs(amount_value)
+        signed_amount = amount_value
+        if not first_non_empty_text(elem, ["TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT"]):
+            signed_amount = base_amount * (Decimal("-1") if direct_child_text(elem, "ISDEEMEDPOSITIVE").upper() == "YES" else Decimal("1"))
 
-        entries = direct_children(voucher, "ALLLEDGERENTRIES.LIST") or direct_children(voucher, "LEDGERENTRIES.LIST")
-        for entry in entries:
-            ledger_name = direct_child_text(entry, "LEDGERNAME")
-            amount_value = to_decimal(direct_child_text(entry, "AMOUNT"))
-            if not ledger_name or amount_value == 0:
-                continue
+        debit_amount = to_decimal(first_non_empty_text(elem, ["TXMLDEBITAMOUNT", "DEBITAMOUNT"]))
+        credit_amount = to_decimal(first_non_empty_text(elem, ["TXMLCREDITAMOUNT", "CREDITAMOUNT"]))
+        if debit_amount == 0 and credit_amount == 0:
+            debit_amount = base_amount if signed_amount < 0 else Decimal("0.00")
+            credit_amount = base_amount if signed_amount > 0 else Decimal("0.00")
 
-            is_positive = direct_child_text(entry, "ISDEEMEDPOSITIVE").upper() == "YES"
-            signed_amount = abs(amount_value) * (Decimal("-1") if is_positive else Decimal("1"))
-            meta = ledger_meta.get(ledger_name, {})
+        meta = ledger_meta.get(ledger_name, {})
+        primary_group = first_non_empty_text(elem, ["TXMLENTRYPRIMARYGROUP", "ENTRYPRIMARYGROUP", "PRIMARYGROUP"]) or meta.get("PrimaryGroup", "")
+        nature = meta.get("Nature", "")
+        nature_of_group = meta.get("NatureOfGroup", "")
+        if not nature and primary_group:
+            nature, nature_of_group = nature_from_primary_group(primary_group)
 
-            rows.append({
-                "Date": voucher_date,
-                "VoucherTypeName": voucher_type,
-                "BaseVoucherType": base_voucher_type,
-                "VoucherNumber": voucher_number,
-                "LedgerName": ledger_name,
-                "MasterID": direct_child_text(entry, "ENTRYLEDGERMASTERID") or meta.get("MasterID", ""),
-                "Amount": float(signed_amount),
-                "DrCr": "Dr" if signed_amount < 0 else "Cr",
-                "DebitAmount": float(abs(signed_amount)) if signed_amount < 0 else 0.0,
-                "CreditAmount": float(abs(signed_amount)) if signed_amount > 0 else 0.0,
-                "ParentLedger": direct_child_text(entry, "ENTRYPARENTLEDGER") or meta.get("Parent", ""),
-                "PrimaryGroup": direct_child_text(entry, "ENTRYPRIMARYGROUP") or meta.get("PrimaryGroup", ""),
-                "Nature": meta.get("Nature", ""),
-                "NatureOfGroup": meta.get("NatureOfGroup", ""),
-                "PAN": meta.get("PAN", ""),
-                "PartyLedgerName": direct_child_text(voucher, "PARTYLEDGERNAME"),
-                "PartyGSTIN": direct_child_text(voucher, "PARTYGSTIN"),
-                "LedgerGSTIN": direct_child_text(entry, "ENTRYLEDGERGSTIN") or meta.get("PartyGSTIN", ""),
-                "VoucherNarration": voucher_narration,
-                "IsOptional": "Yes" if direct_child_text(voucher, "ISOPTIONAL").upper() == "YES" else "No",
-                "CompanyName": company,
-                "FromDate": formatted_from_date,
-                "ToDate": formatted_to_date,
-                "VoucherCategory": voucher_category,
-            })
+        is_optional = first_non_empty_text(elem, ["TXMLSTATUSOPTIONAL", "STATUSOPTIONAL", "ISOPTIONAL"])
+        if is_optional.upper() == "YES":
+            is_optional = "Yes"
+        elif is_optional.upper() == "NO":
+            is_optional = "No"
+
+        rows.append({
+            "Date": format_tally_date(first_non_empty_text(elem, ["TXMLDATE", "DATE"])),
+            "VoucherTypeName": voucher_type,
+            "BaseVoucherType": base_voucher_type,
+            "VoucherNumber": first_non_empty_text(elem, ["TXMLVOUCHERNUMBER", "VOUCHERNUMBER"]),
+            "LedgerName": ledger_name,
+            "MasterID": first_non_empty_text(elem, ["TXMLENTRYLEDGERMASTERID", "ENTRYLEDGERMASTERID", "LEDMASTERID"]) or meta.get("MasterID", ""),
+            "Amount": float(signed_amount),
+            "DrCr": first_non_empty_text(elem, ["TXMLDRCR", "DRCR"]) or ("Dr" if signed_amount < 0 else "Cr"),
+            "DebitAmount": float(debit_amount),
+            "CreditAmount": float(credit_amount),
+            "ParentLedger": first_non_empty_text(elem, ["TXMLENTRYPARENTLEDGER", "ENTRYPARENTLEDGER", "PARENTLEDGER"]) or meta.get("Parent", ""),
+            "PrimaryGroup": primary_group,
+            "Nature": nature,
+            "NatureOfGroup": nature_of_group,
+            "PAN": meta.get("PAN", ""),
+            "PartyLedgerName": first_non_empty_text(elem, ["TXMLPARTYLEDGERNAME", "PARTYLEDGERNAME"]) or "N/A",
+            "PartyGSTIN": first_non_empty_text(elem, ["TXMLPARTYGSTIN", "PARTYGSTIN"]),
+            "LedgerGSTIN": first_non_empty_text(elem, ["TXMLENTRYLEDGERGSTIN", "ENTRYLEDGERGSTIN", "LEDGERGSTIN"]) or meta.get("PartyGSTIN", ""),
+            "VoucherNarration": first_non_empty_text(elem, ["TXMLVOUCHERNARRATION", "NARRATION", "VOUCHERNARRATION"]),
+            "IsOptional": is_optional or "No",
+            "CompanyName": first_non_empty_text(elem, ["TXMLCOMPANYNAME", "COMPANYNAME"]) or company,
+            "FromDate": formatted_from_date,
+            "ToDate": formatted_to_date,
+            "VoucherCategory": voucher_category,
+        })
 
     return rows
 
@@ -564,19 +588,8 @@ def load_voucher_data(accounting_only=False):
 
     voucher_rows = []
     for chunk_from, chunk_to in plan_export_chunks(url, selected_company, selected_from, selected_to):
-        try:
-            xml = fetch_xml_cached(url, build_voucher_request_xml(selected_company, chunk_from, chunk_to), selected_company, "vouchers", chunk_from, chunk_to)
-            voucher_rows.extend(parse_voucher_rows(parse_xml_root(xml), ledger_meta, selected_company, selected_from, selected_to, vtype_map))
-        except Exception:
-            start_date = parse_tally_date_value(chunk_from)
-            end_date = parse_tally_date_value(chunk_to)
-            if not start_date or not end_date or start_date >= end_date:
-                raise
-            for day_start, day_end in split_period(start_date, end_date, "daily"):
-                day_from = day_start.strftime("%Y%m%d")
-                day_to = day_end.strftime("%Y%m%d")
-                xml = fetch_xml_cached(url, build_voucher_request_xml(selected_company, day_from, day_to), selected_company, "vouchers", day_from, day_to)
-                voucher_rows.extend(parse_voucher_rows(parse_xml_root(xml), ledger_meta, selected_company, selected_from, selected_to, vtype_map))
+        xml = fetch_xml_cached(url, build_flat_voucher_request_xml(selected_company, chunk_from, chunk_to), selected_company, "vouchers_flat", chunk_from, chunk_to)
+        voucher_rows.extend(parse_flat_voucher_rows(parse_xml_root(xml), ledger_meta, selected_company, selected_from, selected_to, vtype_map))
 
     df = pd.DataFrame(voucher_rows)
     if df.empty:

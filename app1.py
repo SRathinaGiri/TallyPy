@@ -541,7 +541,7 @@ def plan_export_chunks(url, company, from_date, to_date):
 
 def cache_file_path(company, table_name, from_date, to_date, master_from=None, master_to=None):
     cache_root = os.path.join(os.getcwd(), ".tally_cache")
-    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), clean_text(master_from), clean_text(master_to), "xml-v5"])
+    key_text = "|".join([clean_text(company), table_name, clean_text(from_date), clean_text(to_date), clean_text(master_from), clean_text(master_to), "xml-v6"])
     file_name = hashlib.sha1(key_text.encode("utf-8", errors="ignore")).hexdigest() + ".xml"
     return os.path.join(cache_root, file_name)
 
@@ -591,11 +591,12 @@ def fetch_chunked_rows(url, company, from_date, to_date, table_name, build_reque
             if status == "0":
                 error_text = first_descendant_text(root, "LINEERROR") or "Tally returned STATUS=0"
                 raise ValueError(error_text)
+            chunk_rows = parse_chunk(root, chunk_from, chunk_to)
             if chunk.get("master_from") is not None and chunk.get("expected_count") is not None:
                 detail_count = sum(1 for elem in root.iter() if is_real_voucher(elem))
-                if detail_count < chunk["expected_count"]:
+                if detail_count and detail_count < chunk["expected_count"]:
                     raise ValueError(f"MasterID-filtered response returned {detail_count} voucher header(s), expected {chunk['expected_count']}.")
-            rows.extend(parse_chunk(root, chunk_from, chunk_to))
+            rows.extend(chunk_rows)
         except Exception:
             master_from = chunk.get("master_from")
             master_to = chunk.get("master_to")
@@ -672,7 +673,7 @@ def build_ledger_request_xml(company):
     )
 
 
-def build_voucher_request_xml(company, from_date, to_date, master_from=None, master_to=None):
+def build_flat_voucher_request_xml(company, from_date, to_date, master_from=None, master_to=None):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
@@ -682,22 +683,35 @@ def build_voucher_request_xml(company, from_date, to_date, master_from=None, mas
 
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
-        "<TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER><BODY><DESC>"
+        "<TYPE>COLLECTION</TYPE><ID>TXMLFlatVoucherRows</ID></HEADER><BODY><DESC>"
         f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        "<OBJECT NAME=\"All Ledger Entries\">"
-        "<COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
-        "<COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
-        "<COMPUTE>EntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
-        "<COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
-        "</OBJECT>"
-        "<COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
+        "<COLLECTION NAME=\"TXMLBaseVouchers\"><TYPE>Voucher</TYPE>"
         f"{collection_filter}"
-        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, "
-        "PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, "
-        "AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, "
-        "AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, "
-        "AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
+        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional</FETCH>"
+        "</COLLECTION>"
+        "<COLLECTION NAME=\"TXMLFlatVoucherRows\"><SOURCECOLLECTION>TXMLBaseVouchers</SOURCECOLLECTION>"
+        "<WALK>All Ledger Entries</WALK>"
+        "<FETCH>LedgerName, Amount, IsDeemedPositive, TXMLDate, TXMLVoucherTypeName, TXMLVoucherNumber, "
+        "TXMLPartyLedgerName, TXMLPartyGSTIN, TXMLVoucherNarration, TXMLSignedAmount, TXMLDebitAmount, "
+        "TXMLCreditAmount, TXMLDrCr, TXMLEntryLedgerMasterID, TXMLEntryParentLedger, TXMLEntryPrimaryGroup, "
+        "TXMLEntryLedgerGSTIN, TXMLStatusOptional, TXMLCompanyName</FETCH>"
+        "<COMPUTE>TXMLDate:$..Date</COMPUTE>"
+        "<COMPUTE>TXMLVoucherTypeName:$..VoucherTypeName</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNumber:$..VoucherNumber</COMPUTE>"
+        "<COMPUTE>TXMLPartyLedgerName:If NOT $$IsEmpty:$..PartyLedgerName Then $..PartyLedgerName Else \"N/A\"</COMPUTE>"
+        "<COMPUTE>TXMLPartyGSTIN:$..PartyGSTIN</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
+        "<COMPUTE>TXMLSignedAmount:If $IsDeemedPositive Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDebitAmount:If $IsDeemedPositive Then $$Abs:$Amount Else 0</COMPUTE>"
+        "<COMPUTE>TXMLCreditAmount:If $IsDeemedPositive Then 0 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDrCr:If $IsDeemedPositive Then \"Dr\" Else \"Cr\"</COMPUTE>"
+        "<COMPUTE>TXMLEntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
+        "<COMPUTE>TXMLEntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
+        "<COMPUTE>TXMLEntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
+        "<COMPUTE>TXMLEntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
+        "<COMPUTE>TXMLStatusOptional:If $..IsOptional Then \"Yes\" Else \"No\"</COMPUTE>"
+        "<COMPUTE>TXMLCompanyName:##SVCurrentCompany</COMPUTE>"
         "</COLLECTION>"
         f"{filter_formula}"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
@@ -724,7 +738,7 @@ def build_stock_item_request_xml(company):
     )
 
 
-def build_inventory_entries_request_xml(company, from_date, to_date, master_from=None, master_to=None):
+def build_flat_inventory_entries_request_xml(company, from_date, to_date, master_from=None, master_to=None):
     static_vars = ["<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"]
     if company:
         static_vars.append(f"<SVCURRENTCOMPANY>{escape(company)}</SVCURRENTCOMPANY>")
@@ -734,13 +748,26 @@ def build_inventory_entries_request_xml(company, from_date, to_date, master_from
 
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
-        "<TYPE>COLLECTION</TYPE><ID>MyInventoryVouchers</ID></HEADER><BODY><DESC>"
+        "<TYPE>COLLECTION</TYPE><ID>TXMLFlatInventoryRows</ID></HEADER><BODY><DESC>"
         f"<STATICVARIABLES>{''.join(static_vars)}</STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        "<COLLECTION NAME=\"MyInventoryVouchers\"><TYPE>Voucher</TYPE>"
+        "<COLLECTION NAME=\"TXMLBaseInventoryVouchers\"><TYPE>Voucher</TYPE>"
         f"{collection_filter}"
-        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, "
-        "InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH>"
+        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration</FETCH>"
+        "</COLLECTION>"
+        "<COLLECTION NAME=\"TXMLFlatInventoryRows\"><SOURCECOLLECTION>TXMLBaseInventoryVouchers</SOURCECOLLECTION>"
+        "<WALK>All Inventory Entries</WALK>"
+        "<FETCH>StockItemName, BilledQty, Rate, Amount, TXMLDate, TXMLVoucherTypeName, TXMLVoucherNumber, "
+        "TXMLVoucherNarration, TXMLCompanyName, TXMLSignedQty, TXMLSignedAmount, TXMLGodownName, TXMLBatchName</FETCH>"
+        "<COMPUTE>TXMLDate:$..Date</COMPUTE>"
+        "<COMPUTE>TXMLVoucherTypeName:$..VoucherTypeName</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNumber:$..VoucherNumber</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
+        "<COMPUTE>TXMLCompanyName:##SVCurrentCompany</COMPUTE>"
+        "<COMPUTE>TXMLSignedQty:If $IsDeemedPositive Then $$Abs:$BilledQty Else $$Abs:$BilledQty * -1</COMPUTE>"
+        "<COMPUTE>TXMLSignedAmount:If $IsDeemedPositive Then $$Abs:$Amount Else $$Abs:$Amount * -1</COMPUTE>"
+        "<COMPUTE>TXMLGodownName:$GodownName</COMPUTE>"
+        "<COMPUTE>TXMLBatchName:$BatchName</COMPUTE>"
         "</COLLECTION>"
         f"{filter_formula}"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
@@ -821,98 +848,71 @@ def parse_ledgers(root, group_map=None):
     return output_rows
 
 
-def parse_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=None):
+def parse_flat_vouchers(root, ledger_meta, company, from_date, to_date, vtype_map=None):
     rows = []
     formatted_from_date = format_tally_date(from_date)
     formatted_to_date = format_tally_date(to_date)
-    
-    if vtype_map is None:
-        vtype_map = {}
+    vtype_map = vtype_map or {}
 
-    for voucher in root.iter():
-        if not is_real_voucher(voucher):
+    for elem in root.iter():
+        ledger_name = direct_child_text(elem, "LEDGERNAME")
+        amount_value = to_decimal(first_non_empty_text(elem, ["TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT", "AMOUNT"]))
+        if not ledger_name or amount_value == 0:
             continue
 
-        voucher_type = canonical_voucher_type_name(direct_child_text(voucher, "VOUCHERTYPENAME"))
+        voucher_type = canonical_voucher_type_name(first_non_empty_text(elem, ["TXMLVOUCHERTYPENAME", "VOUCHERTYPENAME"]))
         base_v_type = canonical_voucher_type_name(vtype_map.get(voucher_type, voucher_type))
-
         voucher_category = voucher_category_from_base_type(base_v_type)
+        base_amount = abs(amount_value)
+        signed_amount = amount_value
+        if not first_non_empty_text(elem, ["TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT"]):
+            signed_amount = base_amount * (Decimal("-1") if direct_child_text(elem, "ISDEEMEDPOSITIVE").upper() == "YES" else Decimal("1"))
 
-        voucher_date = format_tally_date(direct_child_text(voucher, "DATE"))
-        voucher_number = direct_child_text(voucher, "VOUCHERNUMBER")
-        party_ledger_name = direct_child_text(voucher, "PARTYLEDGERNAME") or "N/A"
-        voucher_gstin = direct_child_text(voucher, "PARTYGSTIN")
-        voucher_narration = first_non_empty_text(voucher, ["NARRATION", "VOUCHERNARRATION"])
-        is_optional = "Yes" if direct_child_text(voucher, "ISOPTIONAL").upper() == "YES" else "No"
-        voucher_company = first_non_empty_text(voucher, ["COMPANYNAME", "SVCURRENTCOMPANY"]) or company
-
-        entry_nodes = direct_children(voucher, "ALLLEDGERENTRIES.LIST")
-        if not entry_nodes:
-            entry_nodes = direct_children(voucher, "LEDGERENTRIES.LIST")
-
-        for entry in entry_nodes:
-            ledger_name = direct_child_text(entry, "LEDGERNAME")
-            amount_value = to_decimal(direct_child_text(entry, "AMOUNT"))
-            is_deemed_positive = direct_child_text(entry, "ISDEEMEDPOSITIVE").upper()
-
-            if not ledger_name or amount_value == 0:
-                continue
-
-            base_amount = abs(amount_value)
-            signed_amount = base_amount * Decimal("-1") if is_deemed_positive == "YES" else base_amount
-            dr_cr = "Dr" if signed_amount < 0 else "Cr"
+        debit_amount = to_decimal(first_non_empty_text(elem, ["TXMLDEBITAMOUNT", "DEBITAMOUNT"]))
+        credit_amount = to_decimal(first_non_empty_text(elem, ["TXMLCREDITAMOUNT", "CREDITAMOUNT"]))
+        if debit_amount == 0 and credit_amount == 0:
             debit_amount = base_amount if signed_amount < 0 else Decimal("0.00")
             credit_amount = base_amount if signed_amount > 0 else Decimal("0.00")
 
-            meta = ledger_meta.get(ledger_name, {})
-            primary_group = meta.get("PrimaryGroup", "")
-            parent_ledger = meta.get("Parent", "")
-            ledger_gstin = meta.get("PartyGSTIN", "")
-            ledger_master_id = meta.get("MasterID", "")
-            nature = meta.get("Nature", "")
-            nature_of_group = meta.get("NatureOfGroup", "")
-            pan = meta.get("PAN", "")
+        meta = ledger_meta.get(ledger_name, {})
+        primary_group = first_non_empty_text(elem, ["TXMLENTRYPRIMARYGROUP", "ENTRYPRIMARYGROUP", "PRIMARYGROUP"]) or meta.get("PrimaryGroup", "")
+        nature = meta.get("Nature", "")
+        nature_of_group = meta.get("NatureOfGroup", "")
+        if not nature and primary_group:
+            nature, nature_of_group = nature_from_primary_group(primary_group)
 
-            entry_level_master_id = direct_child_text(entry, "ENTRYLEDGERMASTERID")
-            entry_level_parent = direct_child_text(entry, "ENTRYPARENTLEDGER")
-            entry_level_primary_group = direct_child_text(entry, "ENTRYPRIMARYGROUP")
-            entry_level_gstin = direct_child_text(entry, "ENTRYLEDGERGSTIN")
+        is_optional = first_non_empty_text(elem, ["TXMLSTATUSOPTIONAL", "STATUSOPTIONAL", "ISOPTIONAL"])
+        if is_optional.upper() == "YES":
+            is_optional = "Yes"
+        elif is_optional.upper() == "NO":
+            is_optional = "No"
 
-            if entry_level_master_id:
-                ledger_master_id = entry_level_master_id
-            if entry_level_parent:
-                parent_ledger = entry_level_parent
-            if entry_level_primary_group:
-                primary_group = entry_level_primary_group
-            if entry_level_gstin:
-                ledger_gstin = entry_level_gstin
-
-            rows.append({
-                "Date": voucher_date,
-                "VoucherTypeName": voucher_type,
-                "BaseVoucherType": base_v_type,
-                "VoucherNumber": voucher_number,
-                "LedgerName": ledger_name,
-                "MasterID": ledger_master_id,
-                "Amount": float(signed_amount),
-                "DrCr": dr_cr,
-                "DebitAmount": float(debit_amount),
-                "CreditAmount": float(credit_amount),
-                "ParentLedger": parent_ledger,
-                "PrimaryGroup": primary_group,
-                "Nature": nature,
-                "NatureOfGroup": nature_of_group,
-                "PAN": pan,
-                "PartyLedgerName": party_ledger_name,
-                "PartyGSTIN": voucher_gstin,
-                "LedgerGSTIN": ledger_gstin,
-                "VoucherNarration": voucher_narration,
-                "IsOptional": is_optional,
-                "CompanyName": voucher_company,
-                "FromDate": formatted_from_date,
-                "ToDate": formatted_to_date,
-                "VoucherCategory": voucher_category,
-            })
+        rows.append({
+            "Date": format_tally_date(first_non_empty_text(elem, ["TXMLDATE", "DATE"])),
+            "VoucherTypeName": voucher_type,
+            "BaseVoucherType": base_v_type,
+            "VoucherNumber": first_non_empty_text(elem, ["TXMLVOUCHERNUMBER", "VOUCHERNUMBER"]),
+            "LedgerName": ledger_name,
+            "MasterID": first_non_empty_text(elem, ["TXMLENTRYLEDGERMASTERID", "ENTRYLEDGERMASTERID", "LEDMASTERID"]) or meta.get("MasterID", ""),
+            "Amount": float(signed_amount),
+            "DrCr": first_non_empty_text(elem, ["TXMLDRCR", "DRCR"]) or ("Dr" if signed_amount < 0 else "Cr"),
+            "DebitAmount": float(debit_amount),
+            "CreditAmount": float(credit_amount),
+            "ParentLedger": first_non_empty_text(elem, ["TXMLENTRYPARENTLEDGER", "ENTRYPARENTLEDGER", "PARENTLEDGER"]) or meta.get("Parent", ""),
+            "PrimaryGroup": primary_group,
+            "Nature": nature,
+            "NatureOfGroup": nature_of_group,
+            "PAN": meta.get("PAN", ""),
+            "PartyLedgerName": first_non_empty_text(elem, ["TXMLPARTYLEDGERNAME", "PARTYLEDGERNAME"]) or "N/A",
+            "PartyGSTIN": first_non_empty_text(elem, ["TXMLPARTYGSTIN", "PARTYGSTIN"]),
+            "LedgerGSTIN": first_non_empty_text(elem, ["TXMLENTRYLEDGERGSTIN", "ENTRYLEDGERGSTIN", "LEDGERGSTIN"]) or meta.get("PartyGSTIN", ""),
+            "VoucherNarration": first_non_empty_text(elem, ["TXMLVOUCHERNARRATION", "NARRATION", "VOUCHERNARRATION"]),
+            "IsOptional": is_optional or "No",
+            "CompanyName": first_non_empty_text(elem, ["TXMLCOMPANYNAME", "COMPANYNAME"]) or company,
+            "FromDate": formatted_from_date,
+            "ToDate": formatted_to_date,
+            "VoucherCategory": voucher_category,
+        })
 
     return rows
 
@@ -942,56 +942,28 @@ def parse_stock_items(root):
     return rows
 
 
-def parse_inventory_entries(root, company):
+def parse_flat_inventory_entries(root, company):
     rows = []
-    for voucher in root.iter():
-        if not is_real_voucher(voucher):
+    for inv in root.iter():
+        if strip_ns(inv.tag).upper() != "INVENTORYENTRY":
             continue
-        v_type = direct_child_text(voucher, "VOUCHERTYPENAME")
-        if "Order" in v_type:
+        item_name = first_non_empty_text(inv, ["STOCKITEMNAME"])
+        v_type = first_non_empty_text(inv, ["TXMLVOUCHERTYPENAME", "VOUCHERTYPENAME"])
+        if not item_name or "Order" in v_type:
             continue
-        v_date = format_tally_date(direct_child_text(voucher, "DATE"))
-        v_number = direct_child_text(voucher, "VOUCHERNUMBER")
-        v_narration = first_non_empty_text(voucher, ["NARRATION", "VOUCHERNARRATION"])
-        v_company = first_non_empty_text(voucher, ["COMPANYNAME", "SVCURRENTCOMPANY"]) or company
-
-        # GREEDY SEARCH: Find ANY tag that contains inventory data
-        inv_nodes = [child for child in voucher if "INVENTORYENTRIES" in child.tag.upper()]
-
-        for inv in inv_nodes:
-            item_name = direct_child_text(inv, "STOCKITEMNAME")
-            if not item_name:
-                continue
-            
-            is_pos_val = direct_child_text(inv, "ISDEEMEDPOSITIVE")
-            is_inward = (is_pos_val.upper() == "YES")
-
-            amount_val = abs(to_decimal(direct_child_text(inv, "AMOUNT")))
-            qty_text = direct_child_text(inv, "BILLEDQTY")
-            rate_text = direct_child_text(inv, "RATE")
-            qty_val = abs(to_float(qty_text))
-            rate_val = to_float(rate_text)
-            
-            batch_nodes = direct_children(inv, "BATCHALLOCATIONS.LIST")
-            godown = ""
-            batch = ""
-            if batch_nodes:
-                godown = direct_child_text(batch_nodes[0], "GODOWNNAME")
-                batch = direct_child_text(batch_nodes[0], "BATCHNAME")
-
-            rows.append({
-                "Date": v_date,
-                "VoucherTypeName": v_type,
-                "VoucherNumber": v_number,
-                "StockItemName": item_name.strip(),
-                "BilledQty": qty_val if is_inward else -qty_val,
-                "Rate": rate_val,
-                "Amount": float(amount_val if is_inward else -amount_val),
-                "GodownName": godown,
-                "BatchName": batch,
-                "VoucherNarration": v_narration,
-                "CompanyName": v_company,
-            })
+        rows.append({
+            "Date": format_tally_date(first_non_empty_text(inv, ["TXMLDATE", "DATE"])),
+            "VoucherTypeName": v_type,
+            "VoucherNumber": first_non_empty_text(inv, ["TXMLVOUCHERNUMBER", "VOUCHERNUMBER"]),
+            "StockItemName": clean_text(item_name),
+            "BilledQty": to_float(first_non_empty_text(inv, ["TXMLSIGNEDQTY", "BILLEDQTY"])),
+            "Rate": to_float(first_non_empty_text(inv, ["RATE"])),
+            "Amount": to_float(first_non_empty_text(inv, ["TXMLSIGNEDAMOUNT", "AMOUNT"])),
+            "GodownName": first_non_empty_text(inv, ["TXMLGODOWNNAME", "GODOWNNAME"]),
+            "BatchName": first_non_empty_text(inv, ["TXMLBATCHNAME", "BATCHNAME"]),
+            "VoucherNarration": first_non_empty_text(inv, ["TXMLVOUCHERNARRATION", "NARRATION", "VOUCHERNARRATION"]),
+            "CompanyName": first_non_empty_text(inv, ["TXMLCOMPANYNAME", "COMPANYNAME"]) or company,
+        })
     return rows
 
 
@@ -1141,9 +1113,9 @@ def load_tally_data(host, port, company, from_date, to_date):
         selected_company,
         from_date,
         to_date,
-        "vouchers",
-        build_voucher_request_xml,
-        lambda root, chunk_from, chunk_to: parse_vouchers(root, ledger_meta, selected_company, chunk_from, chunk_to, vtype_map),
+        "vouchers_flat",
+        build_flat_voucher_request_xml,
+        lambda root, chunk_from, chunk_to: parse_flat_vouchers(root, ledger_meta, selected_company, chunk_from, chunk_to, vtype_map),
     )
     
     # New Stock Data
@@ -1155,9 +1127,9 @@ def load_tally_data(host, port, company, from_date, to_date):
         selected_company,
         from_date,
         to_date,
-        "inventory",
-        build_inventory_entries_request_xml,
-        lambda root, chunk_from, chunk_to: parse_inventory_entries(root, selected_company),
+        "inventory_flat",
+        build_flat_inventory_entries_request_xml,
+        lambda root, chunk_from, chunk_to: parse_flat_inventory_entries(root, selected_company),
     )
 
     all_voucher_df = pd.DataFrame(voucher_rows)

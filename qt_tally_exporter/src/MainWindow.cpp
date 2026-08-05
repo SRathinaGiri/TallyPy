@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHeaderView>
@@ -12,6 +13,8 @@
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPushButton>
+#include <QRect>
+#include <QScreen>
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QTextStream>
@@ -27,12 +30,30 @@ QString csvEscape(const QString &value) {
     }
     return escaped;
 }
+
+QRect initialWindowGeometry() {
+    constexpr int preferredWidth = 1320;
+    constexpr int preferredHeight = 840;
+    constexpr int desktopMargin = 32;
+
+    const QScreen *screen = QGuiApplication::primaryScreen();
+    if (!screen) {
+        return QRect(80, 80, preferredWidth, preferredHeight);
+    }
+
+    const QRect available = screen->availableGeometry();
+    const int width = qMin(preferredWidth, qMax(available.width() - desktopMargin, available.width() * 9 / 10));
+    const int height = qMin(preferredHeight, qMax(available.height() - desktopMargin, available.height() * 9 / 10));
+    const int x = available.x() + qMax(0, (available.width() - width) / 2);
+    const int y = available.y() + qMax(0, (available.height() - height) / 2);
+    return QRect(x, y, width, height);
+}
 }
 
 MainWindow::MainWindow() {
     setWindowTitle("Tally Qt Exporter");
-    resize(1320, 840);
     buildUi();
+    setGeometry(initialWindowGeometry());
     logFilePath_ = createLogFilePath();
     TallyService::setLogCallback([this](const QString &message) {
         QMetaObject::invokeMethod(this, [this, message]() { logMessage(message); }, Qt::QueuedConnection);

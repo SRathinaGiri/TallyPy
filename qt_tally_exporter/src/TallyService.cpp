@@ -673,7 +673,7 @@ QString cacheFilePath(const QString &company, const QString &tableName, const Ex
         cacheRoot += "/tally_xml";
     }
     const QString keyText = cleanText(company) + "|" + tableName + "|" + cleanText(chunk.fromDate) + "|" + cleanText(chunk.toDate)
-        + "|" + QString::number(chunk.masterFrom) + "|" + QString::number(chunk.masterTo) + "|xml-v5";
+        + "|" + QString::number(chunk.masterFrom) + "|" + QString::number(chunk.masterTo) + "|xml-v6";
     const QString fileName = QString(QCryptographicHash::hash(keyText.toUtf8(), QCryptographicHash::Sha1).toHex()) + ".xml";
     return QDir(cacheRoot).filePath(fileName);
 }
@@ -745,17 +745,18 @@ QVector<QVariantMap> fetchChunkedRows(
                 const QString errorText = firstDescendantText(doc.documentElement(), "LINEERROR");
                 throw std::runtime_error((errorText.isEmpty() ? QString("Tally returned STATUS=0") : errorText).toStdString());
             }
+            const int beforeRows = rows.size();
+            const QVector<QVariantMap> chunkRows = parseChunk(doc, chunkFrom, chunkTo);
             if (chunk.masterFrom >= 0 && chunk.expectedCount >= 0) {
                 const int detailCount = countRealVouchers(doc);
-                if (detailCount < chunk.expectedCount) {
+                if (detailCount > 0 && detailCount < chunk.expectedCount) {
                     throw std::runtime_error(QString("MasterID-filtered response returned %1 voucher header(s), expected %2.")
                                                  .arg(detailCount)
                                                  .arg(chunk.expectedCount)
                                                  .toStdString());
                 }
             }
-            const int beforeRows = rows.size();
-            rows += parseChunk(doc, chunkFrom, chunkTo);
+            rows += chunkRows;
             if (logChunk) {
                 emitLog(QString("%1: chunk parsed %2 row(s) from %3 voucher header(s). Total rows: %4.")
                             .arg(tableName)
@@ -830,7 +831,7 @@ QPair<QString, QString> masterIdFilterXml(int masterFrom, int masterTo) {
     };
 }
 
-QString buildVoucherRequestXml(const QString &company, const QString &fromDate, const QString &toDate, int masterFrom, int masterTo) {
+QString buildFlatVoucherRequestXml(const QString &company, const QString &fromDate, const QString &toDate, int masterFrom, int masterTo) {
     QStringList staticVars = {"<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"};
     if (!company.isEmpty()) {
         staticVars << QString("<SVCURRENTCOMPANY>%1</SVCURRENTCOMPANY>").arg(escapeXml(company));
@@ -840,22 +841,35 @@ QString buildVoucherRequestXml(const QString &company, const QString &fromDate, 
     const auto filter = masterIdFilterXml(masterFrom, masterTo);
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
-        "<TYPE>COLLECTION</TYPE><ID>MyVouchers</ID></HEADER><BODY><DESC>"
+        "<TYPE>COLLECTION</TYPE><ID>TXMLFlatVoucherRows</ID></HEADER><BODY><DESC>"
         + QString("<STATICVARIABLES>%1</STATICVARIABLES>").arg(staticVars.join(""))
         + "<TDL><TDLMESSAGE>"
-        "<OBJECT NAME=\"All Ledger Entries\">"
-        "<COMPUTE>EntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
-        "<COMPUTE>EntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
-        "<COMPUTE>EntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
-        "<COMPUTE>EntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
-        "</OBJECT>"
-        "<COLLECTION NAME=\"MyVouchers\"><TYPE>Voucher</TYPE>"
+        "<COLLECTION NAME=\"TXMLBaseVouchers\"><TYPE>Voucher</TYPE>"
         + filter.first +
-        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, "
-        "PartyGSTIN, IsOptional, AllLedgerEntries.LedgerName, AllLedgerEntries.Amount, "
-        "AllLedgerEntries.IsDeemedPositive, AllLedgerEntries.EntryLedgerMasterID, "
-        "AllLedgerEntries.EntryParentLedger, AllLedgerEntries.EntryPrimaryGroup, "
-        "AllLedgerEntries.EntryLedgerGSTIN</FETCH>"
+        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, PartyLedgerName, PartyGSTIN, IsOptional</FETCH>"
+        "</COLLECTION>"
+        "<COLLECTION NAME=\"TXMLFlatVoucherRows\"><SOURCECOLLECTION>TXMLBaseVouchers</SOURCECOLLECTION>"
+        "<WALK>All Ledger Entries</WALK>"
+        "<FETCH>LedgerName, Amount, IsDeemedPositive, TXMLDate, TXMLVoucherTypeName, TXMLVoucherNumber, "
+        "TXMLPartyLedgerName, TXMLPartyGSTIN, TXMLVoucherNarration, TXMLSignedAmount, TXMLDebitAmount, "
+        "TXMLCreditAmount, TXMLDrCr, TXMLEntryLedgerMasterID, TXMLEntryParentLedger, TXMLEntryPrimaryGroup, "
+        "TXMLEntryLedgerGSTIN, TXMLStatusOptional, TXMLCompanyName</FETCH>"
+        "<COMPUTE>TXMLDate:$..Date</COMPUTE>"
+        "<COMPUTE>TXMLVoucherTypeName:$..VoucherTypeName</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNumber:$..VoucherNumber</COMPUTE>"
+        "<COMPUTE>TXMLPartyLedgerName:If NOT $$IsEmpty:$..PartyLedgerName Then $..PartyLedgerName Else \"N/A\"</COMPUTE>"
+        "<COMPUTE>TXMLPartyGSTIN:$..PartyGSTIN</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
+        "<COMPUTE>TXMLSignedAmount:If $IsDeemedPositive Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDebitAmount:If $IsDeemedPositive Then $$Abs:$Amount Else 0</COMPUTE>"
+        "<COMPUTE>TXMLCreditAmount:If $IsDeemedPositive Then 0 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDrCr:If $IsDeemedPositive Then \"Dr\" Else \"Cr\"</COMPUTE>"
+        "<COMPUTE>TXMLEntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
+        "<COMPUTE>TXMLEntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
+        "<COMPUTE>TXMLEntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
+        "<COMPUTE>TXMLEntryLedgerGSTIN:$PartyGSTIN:Ledger:$LedgerName</COMPUTE>"
+        "<COMPUTE>TXMLStatusOptional:If $..IsOptional Then \"Yes\" Else \"No\"</COMPUTE>"
+        "<COMPUTE>TXMLCompanyName:##SVCurrentCompany</COMPUTE>"
         "</COLLECTION>"
         + filter.second +
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
@@ -882,7 +896,7 @@ QString buildStockItemRequestXml(const QString &company) {
     );
 }
 
-QString buildInventoryEntriesRequestXml(const QString &company, const QString &fromDate, const QString &toDate, int masterFrom, int masterTo) {
+QString buildFlatInventoryEntriesRequestXml(const QString &company, const QString &fromDate, const QString &toDate, int masterFrom, int masterTo) {
     QStringList staticVars = {"<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"};
     if (!company.isEmpty()) {
         staticVars << QString("<SVCURRENTCOMPANY>%1</SVCURRENTCOMPANY>").arg(escapeXml(company));
@@ -892,13 +906,26 @@ QString buildInventoryEntriesRequestXml(const QString &company, const QString &f
     const auto filter = masterIdFilterXml(masterFrom, masterTo);
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>EXPORT</TALLYREQUEST>"
-        "<TYPE>COLLECTION</TYPE><ID>MyInventoryVouchers</ID></HEADER><BODY><DESC>"
+        "<TYPE>COLLECTION</TYPE><ID>TXMLFlatInventoryRows</ID></HEADER><BODY><DESC>"
         + QString("<STATICVARIABLES>%1</STATICVARIABLES>").arg(staticVars.join(""))
         + "<TDL><TDLMESSAGE>"
-        "<COLLECTION NAME=\"MyInventoryVouchers\"><TYPE>Voucher</TYPE>"
+        "<COLLECTION NAME=\"TXMLBaseInventoryVouchers\"><TYPE>Voucher</TYPE>"
         + filter.first +
-        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration, "
-        "InventoryEntries.*, AllInventoryEntries.*, InventoryEntriesIn.*, InventoryEntriesOut.*</FETCH>"
+        "<FETCH>Date, VoucherTypeName, VoucherNumber, Narration</FETCH>"
+        "</COLLECTION>"
+        "<COLLECTION NAME=\"TXMLFlatInventoryRows\"><SOURCECOLLECTION>TXMLBaseInventoryVouchers</SOURCECOLLECTION>"
+        "<WALK>All Inventory Entries</WALK>"
+        "<FETCH>StockItemName, BilledQty, Rate, Amount, TXMLDate, TXMLVoucherTypeName, TXMLVoucherNumber, "
+        "TXMLVoucherNarration, TXMLCompanyName, TXMLSignedQty, TXMLSignedAmount, TXMLGodownName, TXMLBatchName</FETCH>"
+        "<COMPUTE>TXMLDate:$..Date</COMPUTE>"
+        "<COMPUTE>TXMLVoucherTypeName:$..VoucherTypeName</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNumber:$..VoucherNumber</COMPUTE>"
+        "<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
+        "<COMPUTE>TXMLCompanyName:##SVCurrentCompany</COMPUTE>"
+        "<COMPUTE>TXMLSignedQty:If $IsDeemedPositive Then $$Abs:$BilledQty Else $$Abs:$BilledQty * -1</COMPUTE>"
+        "<COMPUTE>TXMLSignedAmount:If $IsDeemedPositive Then $$Abs:$Amount Else $$Abs:$Amount * -1</COMPUTE>"
+        "<COMPUTE>TXMLGodownName:$GodownName</COMPUTE>"
+        "<COMPUTE>TXMLBatchName:$BatchName</COMPUTE>"
         "</COLLECTION>"
         + filter.second +
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
@@ -1091,99 +1118,82 @@ QVector<QVariantMap> parseLedgers(const QDomDocument &doc, const QMap<QString, G
     return output;
 }
 
-QVector<QVariantMap> parseVouchers(const QDomDocument &doc, const QMap<QString, QVariantMap> &ledgerMeta,
-                                   const QString &company, const QString &fromDate, const QString &toDate,
-                                   const QMap<QString, QString> &vtypeMap) {
+QVector<QVariantMap> parseFlatVouchers(const QDomDocument &doc, const QMap<QString, QVariantMap> &ledgerMeta,
+                                       const QString &company, const QString &fromDate, const QString &toDate,
+                                       const QMap<QString, QString> &vtypeMap) {
     QVector<QVariantMap> rows;
     const QString formattedFromDate = formatTallyDate(fromDate);
     const QString formattedToDate = formatTallyDate(toDate);
-    QDomNodeList nodes = doc.elementsByTagName("VOUCHER");
-
-    for (int i = 0; i < nodes.size(); ++i) {
-        const QDomElement voucher = nodes.at(i).toElement();
-        if (!isRealVoucher(voucher)) {
-            continue;
-        }
-
-        const QString voucherType = canonicalVoucherTypeName(directChildText(voucher, "VOUCHERTYPENAME"));
-        const QString baseType = canonicalVoucherTypeName(vtypeMap.value(voucherType, voucherType));
-        const QString voucherCategory = voucherCategoryFromBaseType(baseType);
-
-        const QString voucherDate = formatTallyDate(directChildText(voucher, "DATE"));
-        const QString voucherNumber = directChildText(voucher, "VOUCHERNUMBER");
-        const QString partyLedgerName = directChildText(voucher, "PARTYLEDGERNAME").isEmpty() ? "N/A" : directChildText(voucher, "PARTYLEDGERNAME");
-        const QString voucherGstin = directChildText(voucher, "PARTYGSTIN");
-        const QString voucherNarration = firstNonEmptyText(voucher, {"NARRATION", "VOUCHERNARRATION"});
-        const QString isOptional = directChildText(voucher, "ISOPTIONAL").toUpper() == "YES" ? "Yes" : "No";
-        const QString voucherCompany = firstNonEmptyText(voucher, {"COMPANYNAME", "SVCURRENTCOMPANY"}).isEmpty()
-                                           ? company
-                                           : firstNonEmptyText(voucher, {"COMPANYNAME", "SVCURRENTCOMPANY"});
-
-        QList<QDomElement> entryNodes = directChildren(voucher, "ALLLEDGERENTRIES.LIST");
-        if (entryNodes.isEmpty()) {
-            entryNodes = directChildren(voucher, "LEDGERENTRIES.LIST");
-        }
-
-        for (const QDomElement &entry : entryNodes) {
+    QDomNodeList flatNodes = doc.elementsByTagName("LEDGERENTRY");
+    if (!flatNodes.isEmpty()) {
+        for (int i = 0; i < flatNodes.size(); ++i) {
+            const QDomElement entry = flatNodes.at(i).toElement();
             const QString ledgerName = directChildText(entry, "LEDGERNAME");
-            const double amountValue = toDoubleValue(directChildText(entry, "AMOUNT"));
-            const QString isDeemedPositive = directChildText(entry, "ISDEEMEDPOSITIVE").toUpper();
-            if (ledgerName.isEmpty() || std::abs(amountValue) < 0.0000001) {
+            double signedAmount = toDoubleValue(firstNonEmptyText(entry, {"TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT", "AMOUNT"}));
+            if (ledgerName.isEmpty() || std::abs(signedAmount) < 0.0000001) {
                 continue;
             }
+            const double baseAmount = std::abs(signedAmount);
+            if (firstNonEmptyText(entry, {"TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT"}).isEmpty()) {
+                signedAmount = directChildText(entry, "ISDEEMEDPOSITIVE").toUpper() == "YES" ? -baseAmount : baseAmount;
+            }
 
-            const double baseAmount = std::abs(amountValue);
-            const double signedAmount = isDeemedPositive == "YES" ? -baseAmount : baseAmount;
-            const QString drCr = signedAmount < 0 ? "Dr" : "Cr";
-            const double debitAmount = signedAmount < 0 ? baseAmount : 0.0;
-            const double creditAmount = signedAmount > 0 ? baseAmount : 0.0;
+            const QString voucherType = canonicalVoucherTypeName(firstNonEmptyText(entry, {"TXMLVOUCHERTYPENAME", "VOUCHERTYPENAME"}));
+            const QString baseType = canonicalVoucherTypeName(vtypeMap.value(voucherType, voucherType));
+            const QString voucherCategory = voucherCategoryFromBaseType(baseType);
+            double debitAmount = toDoubleValue(firstNonEmptyText(entry, {"TXMLDEBITAMOUNT", "DEBITAMOUNT"}));
+            double creditAmount = toDoubleValue(firstNonEmptyText(entry, {"TXMLCREDITAMOUNT", "CREDITAMOUNT"}));
+            if (std::abs(debitAmount) < 0.0000001 && std::abs(creditAmount) < 0.0000001) {
+                debitAmount = signedAmount < 0 ? baseAmount : 0.0;
+                creditAmount = signedAmount > 0 ? baseAmount : 0.0;
+            }
 
             QVariantMap meta = ledgerMeta.value(ledgerName);
-            QString primaryGroup = meta.value("PrimaryGroup").toString();
-            QString parentLedger = meta.value("Parent").toString();
-            QString ledgerGstin = meta.value("PartyGSTIN").toString();
-            QString ledgerMasterId = meta.value("MasterID").toString();
+            QString primaryGroup = firstNonEmptyText(entry, {"TXMLENTRYPRIMARYGROUP", "ENTRYPRIMARYGROUP", "PRIMARYGROUP"});
+            if (primaryGroup.isEmpty()) primaryGroup = meta.value("PrimaryGroup").toString();
             QString nature = meta.value("Nature").toString();
             QString natureOfGroup = meta.value("NatureOfGroup").toString();
-            QString pan = meta.value("PAN").toString();
-
-            const QString entryMasterId = directChildText(entry, "ENTRYLEDGERMASTERID");
-            const QString entryParent = directChildText(entry, "ENTRYPARENTLEDGER");
-            const QString entryPrimaryGroup = directChildText(entry, "ENTRYPRIMARYGROUP");
-            const QString entryGstin = directChildText(entry, "ENTRYLEDGERGSTIN");
-
-            if (!entryMasterId.isEmpty()) ledgerMasterId = entryMasterId;
-            if (!entryParent.isEmpty()) parentLedger = entryParent;
-            if (!entryPrimaryGroup.isEmpty()) primaryGroup = entryPrimaryGroup;
-            if (!entryGstin.isEmpty()) ledgerGstin = entryGstin;
             if (nature.isEmpty() && !primaryGroup.isEmpty()) {
                 const auto pair = natureFromPrimaryGroup(primaryGroup);
                 nature = pair.first;
                 natureOfGroup = pair.second;
             }
 
+            QString optional = firstNonEmptyText(entry, {"TXMLSTATUSOPTIONAL", "STATUSOPTIONAL", "ISOPTIONAL"});
+            if (optional.toUpper() == "YES") {
+                optional = "Yes";
+            } else if (optional.toUpper() == "NO" || optional.isEmpty()) {
+                optional = "No";
+            }
+
             QVariantMap row;
-            row.insert("Date", voucherDate);
+            row.insert("Date", formatTallyDate(firstNonEmptyText(entry, {"TXMLDATE", "DATE"})));
             row.insert("VoucherTypeName", voucherType);
             row.insert("BaseVoucherType", baseType);
-            row.insert("VoucherNumber", voucherNumber);
+            row.insert("VoucherNumber", firstNonEmptyText(entry, {"TXMLVOUCHERNUMBER", "VOUCHERNUMBER"}));
             row.insert("LedgerName", ledgerName);
-            row.insert("MasterID", ledgerMasterId);
+            row.insert("MasterID", firstNonEmptyText(entry, {"TXMLENTRYLEDGERMASTERID", "ENTRYLEDGERMASTERID", "LEDMASTERID"}).isEmpty()
+                                       ? meta.value("MasterID").toString()
+                                       : firstNonEmptyText(entry, {"TXMLENTRYLEDGERMASTERID", "ENTRYLEDGERMASTERID", "LEDMASTERID"}));
             row.insert("Amount", numberToString(signedAmount));
-            row.insert("DrCr", drCr);
+            row.insert("DrCr", firstNonEmptyText(entry, {"TXMLDRCR", "DRCR"}).isEmpty() ? (signedAmount < 0 ? "Dr" : "Cr") : firstNonEmptyText(entry, {"TXMLDRCR", "DRCR"}));
             row.insert("DebitAmount", numberToString(debitAmount));
             row.insert("CreditAmount", numberToString(creditAmount));
-            row.insert("ParentLedger", parentLedger);
+            row.insert("ParentLedger", firstNonEmptyText(entry, {"TXMLENTRYPARENTLEDGER", "ENTRYPARENTLEDGER", "PARENTLEDGER"}).isEmpty()
+                                          ? meta.value("Parent").toString()
+                                          : firstNonEmptyText(entry, {"TXMLENTRYPARENTLEDGER", "ENTRYPARENTLEDGER", "PARENTLEDGER"}));
             row.insert("PrimaryGroup", primaryGroup);
             row.insert("Nature", nature);
             row.insert("NatureOfGroup", natureOfGroup);
-            row.insert("PAN", pan);
-            row.insert("PartyLedgerName", partyLedgerName);
-            row.insert("PartyGSTIN", voucherGstin);
-            row.insert("LedgerGSTIN", ledgerGstin);
-            row.insert("VoucherNarration", voucherNarration);
-            row.insert("IsOptional", isOptional);
-            row.insert("CompanyName", voucherCompany);
+            row.insert("PAN", meta.value("PAN").toString());
+            row.insert("PartyLedgerName", firstNonEmptyText(entry, {"TXMLPARTYLEDGERNAME", "PARTYLEDGERNAME"}).isEmpty() ? "N/A" : firstNonEmptyText(entry, {"TXMLPARTYLEDGERNAME", "PARTYLEDGERNAME"}));
+            row.insert("PartyGSTIN", firstNonEmptyText(entry, {"TXMLPARTYGSTIN", "PARTYGSTIN"}));
+            row.insert("LedgerGSTIN", firstNonEmptyText(entry, {"TXMLENTRYLEDGERGSTIN", "ENTRYLEDGERGSTIN", "LEDGERGSTIN"}).isEmpty()
+                                          ? meta.value("PartyGSTIN").toString()
+                                          : firstNonEmptyText(entry, {"TXMLENTRYLEDGERGSTIN", "ENTRYLEDGERGSTIN", "LEDGERGSTIN"}));
+            row.insert("VoucherNarration", firstNonEmptyText(entry, {"TXMLVOUCHERNARRATION", "NARRATION", "VOUCHERNARRATION"}));
+            row.insert("IsOptional", optional);
+            row.insert("CompanyName", firstNonEmptyText(entry, {"TXMLCOMPANYNAME", "COMPANYNAME"}).isEmpty() ? company : firstNonEmptyText(entry, {"TXMLCOMPANYNAME", "COMPANYNAME"}));
             row.insert("FromDate", formattedFromDate);
             row.insert("ToDate", formattedToDate);
             row.insert("VoucherCategory", voucherCategory);
@@ -1225,65 +1235,32 @@ QVector<QVariantMap> parseStockItems(const QDomDocument &doc) {
     return rows;
 }
 
-QVector<QVariantMap> parseInventoryEntries(const QDomDocument &doc, const QString &company) {
+QVector<QVariantMap> parseFlatInventoryEntries(const QDomDocument &doc, const QString &company) {
     QVector<QVariantMap> rows;
-    QDomNodeList nodes = doc.elementsByTagName("VOUCHER");
+    QDomNodeList nodes = doc.elementsByTagName("INVENTORYENTRY");
     for (int i = 0; i < nodes.size(); ++i) {
-        const QDomElement voucher = nodes.at(i).toElement();
-        if (!isRealVoucher(voucher)) {
+        const QDomElement inv = nodes.at(i).toElement();
+        const QString itemName = firstNonEmptyText(inv, {"STOCKITEMNAME"});
+        const QString voucherType = firstNonEmptyText(inv, {"TXMLVOUCHERTYPENAME", "VOUCHERTYPENAME"});
+        if (itemName.isEmpty() || voucherType.contains("Order", Qt::CaseInsensitive)) {
             continue;
         }
 
-        const QString voucherType = directChildText(voucher, "VOUCHERTYPENAME");
-        if (voucherType.contains("Order", Qt::CaseInsensitive)) {
-            continue;
-        }
-
-        const QString voucherDate = formatTallyDate(directChildText(voucher, "DATE"));
-        const QString voucherNumber = directChildText(voucher, "VOUCHERNUMBER");
-        const QString voucherNarration = firstNonEmptyText(voucher, {"NARRATION", "VOUCHERNARRATION"});
-        const QString voucherCompany = firstNonEmptyText(voucher, {"COMPANYNAME", "SVCURRENTCOMPANY"}).isEmpty()
-                                           ? company
-                                           : firstNonEmptyText(voucher, {"COMPANYNAME", "SVCURRENTCOMPANY"});
-
-        QDomNode childNode = voucher.firstChild();
-        while (!childNode.isNull()) {
-            if (childNode.isElement()) {
-                const QDomElement inv = childNode.toElement();
-                if (stripNs(inv.tagName()).toUpper().contains("INVENTORYENTRIES")) {
-                    const QString itemName = directChildText(inv, "STOCKITEMNAME");
-                    if (!itemName.isEmpty()) {
-                        const bool isInward = directChildText(inv, "ISDEEMEDPOSITIVE").toUpper() == "YES";
-                        const double amount = std::abs(toDoubleValue(directChildText(inv, "AMOUNT")));
-                        const double qty = std::abs(toDoubleValue(directChildText(inv, "BILLEDQTY")));
-                        const double rate = toDoubleValue(directChildText(inv, "RATE"));
-
-                        QString godown;
-                        QString batch;
-                        const QList<QDomElement> batches = directChildren(inv, "BATCHALLOCATIONS.LIST");
-                        if (!batches.isEmpty()) {
-                            godown = directChildText(batches.first(), "GODOWNNAME");
-                            batch = directChildText(batches.first(), "BATCHNAME");
-                        }
-
-                        QVariantMap row;
-                        row.insert("Date", voucherDate);
-                        row.insert("VoucherTypeName", voucherType);
-                        row.insert("VoucherNumber", voucherNumber);
-                        row.insert("StockItemName", itemName.trimmed());
-                        row.insert("BilledQty", numberToString(isInward ? qty : -qty));
-                        row.insert("Rate", numberToString(rate));
-                        row.insert("Amount", numberToString(isInward ? amount : -amount));
-                        row.insert("GodownName", godown);
-                        row.insert("BatchName", batch);
-                        row.insert("VoucherNarration", voucherNarration);
-                        row.insert("CompanyName", voucherCompany);
-                        rows.append(row);
-                    }
-                }
-            }
-            childNode = childNode.nextSibling();
-        }
+        QVariantMap row;
+        row.insert("Date", formatTallyDate(firstNonEmptyText(inv, {"TXMLDATE", "DATE"})));
+        row.insert("VoucherTypeName", voucherType);
+        row.insert("VoucherNumber", firstNonEmptyText(inv, {"TXMLVOUCHERNUMBER", "VOUCHERNUMBER"}));
+        row.insert("StockItemName", itemName.trimmed());
+        row.insert("BilledQty", numberToString(toDoubleValue(firstNonEmptyText(inv, {"TXMLSIGNEDQTY", "BILLEDQTY"}))));
+        row.insert("Rate", numberToString(toDoubleValue(firstNonEmptyText(inv, {"RATE"}))));
+        row.insert("Amount", numberToString(toDoubleValue(firstNonEmptyText(inv, {"TXMLSIGNEDAMOUNT", "AMOUNT"}))));
+        row.insert("GodownName", firstNonEmptyText(inv, {"TXMLGODOWNNAME", "GODOWNNAME"}));
+        row.insert("BatchName", firstNonEmptyText(inv, {"TXMLBATCHNAME", "BATCHNAME"}));
+        row.insert("VoucherNarration", firstNonEmptyText(inv, {"TXMLVOUCHERNARRATION", "NARRATION", "VOUCHERNARRATION"}));
+        row.insert("CompanyName", firstNonEmptyText(inv, {"TXMLCOMPANYNAME", "COMPANYNAME"}).isEmpty()
+                                      ? company
+                                      : firstNonEmptyText(inv, {"TXMLCOMPANYNAME", "COMPANYNAME"}));
+        rows.append(row);
     }
     return rows;
 }
@@ -1417,16 +1394,16 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
     }
     emitLog(QString("Ledgers parsed. Rows: %1.").arg(ledgerRows.size()));
 
-    emitLog("Fetching accounting/all voucher rows with probe-based chunking.");
+    emitLog("Fetching accounting/all voucher rows with Tally-side flat ledger-entry TDL and probe-based chunking.");
     const QVector<QVariantMap> allVoucherRows = fetchChunkedRows(
         url,
         selectedCompany,
         selectedFrom,
         selectedTo,
-        "vouchers",
-        buildVoucherRequestXml,
+        "vouchers_flat",
+        buildFlatVoucherRequestXml,
         [&](const QDomDocument &doc, const QString &chunkFrom, const QString &chunkTo) {
-            return parseVouchers(doc, ledgerMeta, selectedCompany, chunkFrom, chunkTo, vtypeMap);
+            return parseFlatVouchers(doc, ledgerMeta, selectedCompany, chunkFrom, chunkTo, vtypeMap);
         });
     QVector<QVariantMap> voucherRows;
     for (const QVariantMap &row : allVoucherRows) {
@@ -1440,16 +1417,16 @@ TallyDataBundle TallyService::loadAllData(const QString &host, const QString &po
     const QVector<QVariantMap> stockRows = parseStockItems(stockDoc);
     emitLog(QString("Stock items parsed. Rows: %1.").arg(stockRows.size()));
 
-    emitLog("Fetching stock voucher rows with probe-based chunking.");
+    emitLog("Fetching stock voucher rows with Tally-side flat inventory-entry TDL and probe-based chunking.");
     const QVector<QVariantMap> inventoryRows = fetchChunkedRows(
         url,
         selectedCompany,
         selectedFrom,
         selectedTo,
-        "inventory",
-        buildInventoryEntriesRequestXml,
+        "inventory_flat",
+        buildFlatInventoryEntriesRequestXml,
         [&](const QDomDocument &doc, const QString &, const QString &) {
-            return parseInventoryEntries(doc, selectedCompany);
+            return parseFlatInventoryEntries(doc, selectedCompany);
         });
 
     TallyDataBundle bundle;
