@@ -33,9 +33,9 @@ taskkill /IM TallyQtExporter.exe /F >nul 2>nul
 
 if exist "%STAGE_DIR%" rmdir /s /q "%STAGE_DIR%"
 mkdir "%STAGE_DIR%"
-mkdir "%STAGE_DIR%\payload"
+mkdir "%STAGE_DIR%\TallyQtExporter"
 
-xcopy "%DIST_DIR%\*" "%STAGE_DIR%\payload\" /E /I /Y >nul
+xcopy "%DIST_DIR%\*" "%STAGE_DIR%\TallyQtExporter\" /E /I /Y >nul
 if errorlevel 1 exit /b 1
 
 copy "%INSTALLER_DIR%\install.cmd" "%STAGE_DIR%\install.cmd" >nul

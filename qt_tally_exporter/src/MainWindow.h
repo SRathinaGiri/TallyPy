@@ -35,6 +35,8 @@ private:
     void exportTable(const QString &tableId);
     void exportAllTables();
     void populateTableView(QTableView *tableView, const TallyTable &table);
+    void updateSummary(const TallyDataBundle &bundle);
+    void resetSummary();
     bool writeCsvFile(const QString &path, const TallyTable &table, QString *errorMessage = nullptr);
     void setBusy(bool busy);
     void setStatus(const QString &message);
@@ -71,4 +73,5 @@ private:
     QMap<QString, TallyTable> tables_;
     QMap<QString, QTableView *> tableViews_;
     QMap<QString, QAbstractItemModel *> tableModels_;
+    QMap<QString, QLabel *> summaryLabels_;
 };

@@ -13,6 +13,7 @@
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QLocale>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPushButton>
@@ -83,6 +84,65 @@ QString trimCsvLine(QString line) {
         line.chop(1);
     }
     return line;
+}
+
+double csvNumber(const QString &value) {
+    QString normalized = value.trimmed();
+    normalized.remove(',');
+    bool ok = false;
+    const double amount = normalized.toDouble(&ok);
+    return ok ? amount : 0.0;
+}
+
+struct AmountSummary {
+    double amount = 0.0;
+    double debitAmount = 0.0;
+    double creditAmount = 0.0;
+};
+
+AmountSummary summarizeAmountColumns(const TallyTable &table) {
+    AmountSummary summary;
+    if (table.csvPath.isEmpty()) {
+        return summary;
+    }
+
+    QFile file(table.csvPath);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return summary;
+    }
+
+    const QStringList headers = parseCsvLine(trimCsvLine(QString::fromUtf8(file.readLine())));
+    const int amountIndex = headers.indexOf("Amount");
+    const int debitIndex = headers.indexOf("DebitAmount");
+    const int creditIndex = headers.indexOf("CreditAmount");
+    if (amountIndex < 0 && debitIndex < 0 && creditIndex < 0) {
+        return summary;
+    }
+
+    while (!file.atEnd()) {
+        const QStringList row = parseCsvLine(trimCsvLine(QString::fromUtf8(file.readLine())));
+        if (amountIndex >= 0 && amountIndex < row.size()) {
+            summary.amount += csvNumber(row.at(amountIndex));
+        }
+        if (debitIndex >= 0 && debitIndex < row.size()) {
+            summary.debitAmount += csvNumber(row.at(debitIndex));
+        }
+        if (creditIndex >= 0 && creditIndex < row.size()) {
+            summary.creditAmount += csvNumber(row.at(creditIndex));
+        }
+    }
+    return summary;
+}
+
+QString formatCount(int value) {
+    return QLocale().toString(value);
+}
+
+QString formatAmount(double value) {
+    if (qAbs(value) < 0.0000001) {
+        value = 0.0;
+    }
+    return QLocale().toString(value, 'f', 2);
 }
 
 class CsvTableModel final : public QAbstractTableModel {
@@ -232,7 +292,6 @@ void MainWindow::buildUi() {
     detectedFromEdit_->setReadOnly(true);
     detectedToEdit_->setReadOnly(true);
     statusLabel_ = new QLabel("Ready", detailsBox);
-    statsLabel_ = new QLabel("Vouchers: 0 | All Vouchers: 0 | Ledgers: 0 | Stock Items: 0 | Stock Vouchers: 0", detailsBox);
     exportDirEdit_ = new QLineEdit(detailsBox);
     browseExportDirButton_ = new QPushButton("Browse", detailsBox);
     overwriteCheckBox_ = new QCheckBox("Overwrite existing files", detailsBox);
@@ -245,13 +304,12 @@ void MainWindow::buildUi() {
     detailsLayout->addWidget(detectedToEdit_, 2, 1);
     detailsLayout->addWidget(new QLabel("Status", detailsBox), 3, 0);
     detailsLayout->addWidget(statusLabel_, 3, 1);
-    detailsLayout->addWidget(statsLabel_, 4, 0, 1, 2);
-    detailsLayout->addWidget(new QLabel("Export Folder", detailsBox), 5, 0);
+    detailsLayout->addWidget(new QLabel("Export Folder", detailsBox), 4, 0);
     auto *exportDirLayout = new QHBoxLayout();
     exportDirLayout->addWidget(exportDirEdit_);
     exportDirLayout->addWidget(browseExportDirButton_);
-    detailsLayout->addLayout(exportDirLayout, 5, 1);
-    detailsLayout->addWidget(overwriteCheckBox_, 6, 1);
+    detailsLayout->addLayout(exportDirLayout, 4, 1);
+    detailsLayout->addWidget(overwriteCheckBox_, 5, 1);
 
     auto *exportButtonsLayout = new QHBoxLayout();
     auto *exportAllButton = new QPushButton("Export All CSVs", detailsBox);
@@ -267,7 +325,7 @@ void MainWindow::buildUi() {
     exportButtonsLayout->addWidget(exportStockItemsButton);
     exportButtonsLayout->addWidget(exportStockVouchersButton);
     exportButtonsLayout->addStretch(1);
-    detailsLayout->addLayout(exportButtonsLayout, 7, 0, 1, 2);
+    detailsLayout->addLayout(exportButtonsLayout, 6, 0, 1, 2);
 
     topLayout->addWidget(connectionBox, 1);
     topLayout->addWidget(detailsBox, 1);
@@ -280,6 +338,67 @@ void MainWindow::buildUi() {
     logEdit_->setPlaceholderText("Run connection or export actions to see logs.");
     splitter->setStretchFactor(0, 5);
     splitter->setStretchFactor(1, 2);
+
+    auto *summaryPage = new QWidget(tabWidget_);
+    auto *summaryLayout = new QGridLayout(summaryPage);
+    summaryLayout->setColumnStretch(0, 0);
+    summaryLayout->setColumnStretch(1, 1);
+    summaryLayout->setColumnStretch(2, 1);
+    summaryLayout->setColumnStretch(3, 1);
+    summaryLayout->setColumnStretch(4, 1);
+
+    auto *countsBox = new QGroupBox("Counts", summaryPage);
+    auto *countsLayout = new QGridLayout(countsBox);
+    const QList<QPair<QString, QString>> countRows = {
+        {"voucher_count", "Vouchers"},
+        {"all_voucher_count", "All Vouchers"},
+        {"ledger_count", "Ledgers"},
+        {"stock_item_count", "Stock Items"},
+        {"inventory_count", "Stock Vouchers"},
+    };
+    for (int row = 0; row < countRows.size(); ++row) {
+        auto *label = new QLabel(countRows.at(row).second, countsBox);
+        auto *value = new QLabel("0", countsBox);
+        value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        countsLayout->addWidget(label, row, 0);
+        countsLayout->addWidget(value, row, 1);
+        summaryLabels_.insert(countRows.at(row).first, value);
+    }
+
+    auto *amountsBox = new QGroupBox("Accounting Totals", summaryPage);
+    auto *amountsLayout = new QGridLayout(amountsBox);
+    const QStringList amountHeaders = {"Table", "Amount", "Debit Amount", "Credit Amount", "Debit - Credit"};
+    for (int column = 0; column < amountHeaders.size(); ++column) {
+        auto *header = new QLabel(amountHeaders.at(column), amountsBox);
+        header->setStyleSheet("font-weight: 600;");
+        header->setAlignment(column == 0 ? Qt::AlignLeft : Qt::AlignRight);
+        amountsLayout->addWidget(header, 0, column);
+    }
+    const QList<QPair<QString, QString>> amountRows = {
+        {"voucher", "Vouchers CSV"},
+        {"all_voucher", "All Vouchers CSV"},
+    };
+    for (int row = 0; row < amountRows.size(); ++row) {
+        const int layoutRow = row + 1;
+        amountsLayout->addWidget(new QLabel(amountRows.at(row).second, amountsBox), layoutRow, 0);
+        const QString prefix = amountRows.at(row).first;
+        const QStringList keys = {prefix + "_amount", prefix + "_debit", prefix + "_credit", prefix + "_balance"};
+        for (int column = 0; column < keys.size(); ++column) {
+            auto *value = new QLabel("0.00", amountsBox);
+            value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            amountsLayout->addWidget(value, layoutRow, column + 1);
+            summaryLabels_.insert(keys.at(column), value);
+        }
+    }
+    for (int column = 1; column < amountHeaders.size(); ++column) {
+        amountsLayout->setColumnMinimumWidth(column, 140);
+    }
+
+    summaryLayout->addWidget(countsBox, 0, 0);
+    summaryLayout->addWidget(amountsBox, 0, 1, 1, 4);
+    summaryLayout->setRowStretch(1, 1);
+    tabWidget_->addTab(summaryPage, "Summary");
+    resetSummary();
 
     const QList<TallyTable> tableDefs = {
         {"voucher_df", "Vouchers", "vouchers.csv", QStringList()},
@@ -493,28 +612,11 @@ void MainWindow::applyLoadedData(const TallyDataBundle &bundle) {
     detectedFromEdit_->setText(formatRawDate(bundle.fromDateRaw));
     detectedToEdit_->setText(formatRawDate(bundle.toDateRaw));
 
-    int voucherCount = 0;
-    int allVoucherCount = 0;
-    int ledgerCount = 0;
-    int stockItemCount = 0;
-    int inventoryCount = 0;
-
     for (auto it = bundle.tables.constBegin(); it != bundle.tables.constEnd(); ++it) {
         tables_[it.key()] = it.value();
         populateTableView(tableViews_.value(it.key()), it.value());
-        if (it.key() == "voucher_df") voucherCount = it.value().rowCount;
-        if (it.key() == "all_voucher_df") allVoucherCount = it.value().rowCount;
-        if (it.key() == "ledger_df") ledgerCount = it.value().rowCount;
-        if (it.key() == "stock_item_df") stockItemCount = it.value().rowCount;
-        if (it.key() == "inventory_df") inventoryCount = it.value().rowCount;
     }
-
-    statsLabel_->setText(QString("Vouchers: %1 | All Vouchers: %2 | Ledgers: %3 | Stock Items: %4 | Stock Vouchers: %5")
-                             .arg(voucherCount)
-                             .arg(allVoucherCount)
-                             .arg(ledgerCount)
-                             .arg(stockItemCount)
-                             .arg(inventoryCount));
+    updateSummary(bundle);
 
     logMessage(QString("Loaded company=%1, from=%2, to=%3")
                    .arg(bundle.companyName, formatRawDate(bundle.fromDateRaw), formatRawDate(bundle.toDateRaw)));
@@ -608,6 +710,43 @@ void MainWindow::populateTableView(QTableView *tableView, const TallyTable &tabl
     tableModels_.insert(table.id, model);
     tableView->setModel(model);
     tableView->horizontalHeader()->setDefaultSectionSize(140);
+}
+
+void MainWindow::updateSummary(const TallyDataBundle &bundle) {
+    const auto setLabel = [this](const QString &key, const QString &value) {
+        if (QLabel *label = summaryLabels_.value(key, nullptr)) {
+            label->setText(value);
+        }
+    };
+
+    const TallyTable voucherTable = bundle.tables.value("voucher_df");
+    const TallyTable allVoucherTable = bundle.tables.value("all_voucher_df");
+    const TallyTable ledgerTable = bundle.tables.value("ledger_df");
+    const TallyTable stockItemTable = bundle.tables.value("stock_item_df");
+    const TallyTable inventoryTable = bundle.tables.value("inventory_df");
+
+    setLabel("voucher_count", formatCount(voucherTable.rowCount));
+    setLabel("all_voucher_count", formatCount(allVoucherTable.rowCount));
+    setLabel("ledger_count", formatCount(ledgerTable.rowCount));
+    setLabel("stock_item_count", formatCount(stockItemTable.rowCount));
+    setLabel("inventory_count", formatCount(inventoryTable.rowCount));
+
+    const AmountSummary voucherSummary = summarizeAmountColumns(voucherTable);
+    const AmountSummary allVoucherSummary = summarizeAmountColumns(allVoucherTable);
+    const auto setAmountSummary = [&](const QString &prefix, const AmountSummary &summary) {
+        setLabel(prefix + "_amount", formatAmount(summary.amount));
+        setLabel(prefix + "_debit", formatAmount(summary.debitAmount));
+        setLabel(prefix + "_credit", formatAmount(summary.creditAmount));
+        setLabel(prefix + "_balance", formatAmount(summary.debitAmount - summary.creditAmount));
+    };
+    setAmountSummary("voucher", voucherSummary);
+    setAmountSummary("all_voucher", allVoucherSummary);
+}
+
+void MainWindow::resetSummary() {
+    for (auto it = summaryLabels_.begin(); it != summaryLabels_.end(); ++it) {
+        it.value()->setText(it.key().endsWith("_count") ? "0" : "0.00");
+    }
 }
 
 bool MainWindow::writeCsvFile(const QString &path, const TallyTable &table, QString *errorMessage) {

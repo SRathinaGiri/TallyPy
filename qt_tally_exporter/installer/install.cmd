@@ -6,17 +6,17 @@ if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 
 set "APP_NAME=Tally Qt Exporter"
 set "INSTALL_DIR=%ProgramFiles%\Tally Qt Exporter"
-set "PAYLOAD_DIR=%SCRIPT_DIR%\payload"
+set "APP_FILES_DIR=%SCRIPT_DIR%\TallyQtExporter"
 
-if not exist "%PAYLOAD_DIR%\TallyQtExporter.exe" (
-    echo Package payload not found: %PAYLOAD_DIR%
+if not exist "%APP_FILES_DIR%\TallyQtExporter.exe" (
+    echo Package files not found: %APP_FILES_DIR%
     exit /b 1
 )
 
 if exist "%INSTALL_DIR%" rmdir /s /q "%INSTALL_DIR%"
 mkdir "%INSTALL_DIR%"
 
-xcopy "%PAYLOAD_DIR%\*" "%INSTALL_DIR%\" /E /I /Y >nul
+xcopy "%APP_FILES_DIR%\*" "%INSTALL_DIR%\" /E /I /Y >nul
 if errorlevel 1 exit /b 1
 
 set "TARGET_EXE=%INSTALL_DIR%\TallyQtExporter.exe"
