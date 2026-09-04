@@ -12,7 +12,7 @@ set "OUTPUT_EXE=%SCRIPT_DIR%\dist\TallyQtExporter_Setup_v%APP_VERSION%.exe"
 set "ARCHIVE_FILE=%INSTALLER_DIR%\package.7z"
 set "CONFIG_FILE=%INSTALLER_DIR%\config.txt"
 set "SEVENZIP_EXE=C:\Program Files\7-Zip\7z.exe"
-set "SEVENZIP_SFX=C:\Program Files\7-Zip\7z.sfx"
+set "SEVENZIP_SFX=%INSTALLER_DIR%\7zSD.sfx"
 
 if not exist "%DIST_DIR%\TallyQtExporter.exe" (
     echo Portable deployment not found. Run deploy_release.bat first.
@@ -25,7 +25,7 @@ if not exist "%SEVENZIP_EXE%" (
 )
 
 if not exist "%SEVENZIP_SFX%" (
-    echo 7z.sfx not found at %SEVENZIP_SFX%
+    echo 7zSD.sfx not found at %SEVENZIP_SFX%
     exit /b 1
 )
 
