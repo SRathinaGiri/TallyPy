@@ -135,14 +135,14 @@ AmountSummary summarizeAmountColumns(const TallyTable &table) {
 }
 
 QString formatCount(int value) {
-    return QLocale().toString(value);
+    return QLocale(QLocale::English, QLocale::India).toString(value);
 }
 
 QString formatAmount(double value) {
     if (qAbs(value) < 0.0000001) {
         value = 0.0;
     }
-    return QLocale().toString(value, 'f', 2);
+    return QLocale(QLocale::English, QLocale::India).toString(value, 'f', 2);
 }
 
 class CsvTableModel final : public QAbstractTableModel {
@@ -349,6 +349,8 @@ void MainWindow::buildUi() {
 
     auto *countsBox = new QGroupBox("Counts", summaryPage);
     auto *countsLayout = new QGridLayout(countsBox);
+    countsLayout->setHorizontalSpacing(24);
+    countsLayout->setVerticalSpacing(14);
     const QList<QPair<QString, QString>> countRows = {
         {"voucher_count", "Vouchers"},
         {"all_voucher_count", "All Vouchers"},
@@ -356,9 +358,16 @@ void MainWindow::buildUi() {
         {"stock_item_count", "Stock Items"},
         {"inventory_count", "Stock Vouchers"},
     };
+    QFont countLabelFont;
+    countLabelFont.setPointSize(11);
+    QFont countValueFont;
+    countValueFont.setPointSize(18);
+    countValueFont.setBold(true);
     for (int row = 0; row < countRows.size(); ++row) {
         auto *label = new QLabel(countRows.at(row).second, countsBox);
         auto *value = new QLabel("0", countsBox);
+        label->setFont(countLabelFont);
+        value->setFont(countValueFont);
         value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         countsLayout->addWidget(label, row, 0);
         countsLayout->addWidget(value, row, 1);
@@ -367,10 +376,15 @@ void MainWindow::buildUi() {
 
     auto *amountsBox = new QGroupBox("Accounting Totals", summaryPage);
     auto *amountsLayout = new QGridLayout(amountsBox);
+    amountsLayout->setHorizontalSpacing(32);
+    amountsLayout->setVerticalSpacing(18);
     const QStringList amountHeaders = {"Table", "Amount", "Debit Amount", "Credit Amount", "Debit - Credit"};
+    QFont amountHeaderFont;
+    amountHeaderFont.setPointSize(11);
+    amountHeaderFont.setBold(true);
     for (int column = 0; column < amountHeaders.size(); ++column) {
         auto *header = new QLabel(amountHeaders.at(column), amountsBox);
-        header->setStyleSheet("font-weight: 600;");
+        header->setFont(amountHeaderFont);
         header->setAlignment(column == 0 ? Qt::AlignLeft : Qt::AlignRight);
         amountsLayout->addWidget(header, 0, column);
     }
@@ -378,13 +392,21 @@ void MainWindow::buildUi() {
         {"voucher", "Vouchers CSV"},
         {"all_voucher", "All Vouchers CSV"},
     };
+    QFont amountRowFont;
+    amountRowFont.setPointSize(12);
+    QFont amountValueFont;
+    amountValueFont.setPointSize(18);
+    amountValueFont.setBold(true);
     for (int row = 0; row < amountRows.size(); ++row) {
         const int layoutRow = row + 1;
-        amountsLayout->addWidget(new QLabel(amountRows.at(row).second, amountsBox), layoutRow, 0);
+        auto *rowLabel = new QLabel(amountRows.at(row).second, amountsBox);
+        rowLabel->setFont(amountRowFont);
+        amountsLayout->addWidget(rowLabel, layoutRow, 0);
         const QString prefix = amountRows.at(row).first;
         const QStringList keys = {prefix + "_amount", prefix + "_debit", prefix + "_credit", prefix + "_balance"};
         for (int column = 0; column < keys.size(); ++column) {
             auto *value = new QLabel("0.00", amountsBox);
+            value->setFont(amountValueFont);
             value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
             amountsLayout->addWidget(value, layoutRow, column + 1);
             summaryLabels_.insert(keys.at(column), value);

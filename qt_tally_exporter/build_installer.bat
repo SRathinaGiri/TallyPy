@@ -38,6 +38,9 @@ mkdir "%STAGE_DIR%\TallyQtExporter"
 xcopy "%DIST_DIR%\*" "%STAGE_DIR%\TallyQtExporter\" /E /I /Y >nul
 if errorlevel 1 exit /b 1
 
+copy "%INSTALLER_DIR%\uninstall.cmd" "%STAGE_DIR%\TallyQtExporter\uninstall.cmd" >nul
+if errorlevel 1 exit /b 1
+
 copy "%INSTALLER_DIR%\install.cmd" "%STAGE_DIR%\install.cmd" >nul
 
 (

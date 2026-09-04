@@ -7,6 +7,7 @@ if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 set "APP_NAME=Tally Qt Exporter"
 set "INSTALL_DIR=%ProgramFiles%\Tally Qt Exporter"
 set "APP_FILES_DIR=%SCRIPT_DIR%\TallyQtExporter"
+set "UNINSTALL_KEY=HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\TallyQtExporter"
 
 if not exist "%APP_FILES_DIR%\TallyQtExporter.exe" (
     echo Package files not found: %APP_FILES_DIR%
@@ -20,6 +21,16 @@ xcopy "%APP_FILES_DIR%\*" "%INSTALL_DIR%\" /E /I /Y >nul
 if errorlevel 1 exit /b 1
 
 set "TARGET_EXE=%INSTALL_DIR%\TallyQtExporter.exe"
+set "UNINSTALL_CMD=%INSTALL_DIR%\uninstall.cmd"
+
+reg add "%UNINSTALL_KEY%" /v DisplayName /t REG_SZ /d "%APP_NAME%" /f >nul
+reg add "%UNINSTALL_KEY%" /v DisplayVersion /t REG_SZ /d "0.1.8" /f >nul
+reg add "%UNINSTALL_KEY%" /v Publisher /t REG_SZ /d "TallyXML" /f >nul
+reg add "%UNINSTALL_KEY%" /v InstallLocation /t REG_SZ /d "%INSTALL_DIR%" /f >nul
+reg add "%UNINSTALL_KEY%" /v DisplayIcon /t REG_SZ /d "%TARGET_EXE%" /f >nul
+reg add "%UNINSTALL_KEY%" /v UninstallString /t REG_SZ /d """"%UNINSTALL_CMD%"""" /f >nul
+reg add "%UNINSTALL_KEY%" /v NoModify /t REG_DWORD /d 1 /f >nul
+reg add "%UNINSTALL_KEY%" /v NoRepair /t REG_DWORD /d 1 /f >nul
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$WshShell = New-Object -ComObject WScript.Shell; $desktop = [Environment]::GetFolderPath('Desktop'); $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'; $shortcut = $WshShell.CreateShortcut((Join-Path $desktop 'Tally Qt Exporter.lnk')); $shortcut.TargetPath = '%TARGET_EXE%'; $shortcut.WorkingDirectory = '%INSTALL_DIR%'; $shortcut.IconLocation = '%TARGET_EXE%,0'; $shortcut.Save(); $shortcut2 = $WshShell.CreateShortcut((Join-Path $startMenu 'Tally Qt Exporter.lnk')); $shortcut2.TargetPath = '%TARGET_EXE%'; $shortcut2.WorkingDirectory = '%INSTALL_DIR%'; $shortcut2.IconLocation = '%TARGET_EXE%,0'; $shortcut2.Save();"
 if errorlevel 1 exit /b 1
