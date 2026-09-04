@@ -1365,10 +1365,10 @@ def build_flat_voucher_request_xml(company, from_date, to_date, master_from=None
         "<COMPUTE>TXMLPartyLedgerName:If NOT $$IsEmpty:$..PartyLedgerName Then $..PartyLedgerName Else \"N/A\"</COMPUTE>"
         "<COMPUTE>TXMLPartyGSTIN:$..PartyGSTIN</COMPUTE>"
         "<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
-        "<COMPUTE>TXMLSignedAmount:If $IsDeemedPositive Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
-        "<COMPUTE>TXMLDebitAmount:If $IsDeemedPositive Then $$Abs:$Amount Else 0</COMPUTE>"
-        "<COMPUTE>TXMLCreditAmount:If $IsDeemedPositive Then 0 Else $$Abs:$Amount</COMPUTE>"
-        "<COMPUTE>TXMLDrCr:If $IsDeemedPositive Then \"Dr\" Else \"Cr\"</COMPUTE>"
+        "<COMPUTE>TXMLSignedAmount:If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDebitAmount:If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount Else 0</COMPUTE>"
+        "<COMPUTE>TXMLCreditAmount:If ($IsDeemedPositive OR $Amount < 0) Then 0 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDrCr:If ($IsDeemedPositive OR $Amount < 0) Then \"Dr\" Else \"Cr\"</COMPUTE>"
         "<COMPUTE>TXMLEntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
         "<COMPUTE>TXMLEntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
         "<COMPUTE>TXMLEntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
@@ -1610,8 +1610,9 @@ def parse_flat_vouchers(root, ledger_meta, company, from_date, to_date, vtype_ma
 
     for elem in root.iter():
         ledger_name = direct_child_text(elem, "LEDGERNAME")
+        raw_amount = to_decimal(direct_child_text(elem, "AMOUNT"))
         amount_value = to_decimal(first_non_empty_text(elem, ["TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT", "AMOUNT"]))
-        if not ledger_name or amount_value == 0:
+        if not ledger_name or (amount_value == 0 and raw_amount == 0):
             continue
 
         voucher_type = canonical_voucher_type_name(first_non_empty_text(elem, ["TXMLVOUCHERTYPENAME", "VOUCHERTYPENAME"]))
@@ -1628,17 +1629,12 @@ def parse_flat_vouchers(root, ledger_meta, company, from_date, to_date, vtype_ma
         elif is_optional.upper() == "NO":
             is_optional = "No"
 
-        base_amount = abs(amount_value)
-        signed_amount = amount_value
-        if not first_non_empty_text(elem, ["TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT"]):
-            signed_amount = base_amount * (Decimal("-1") if direct_child_text(elem, "ISDEEMEDPOSITIVE").upper() == "YES" else Decimal("1"))
-        dr_cr = first_non_empty_text(elem, ["DRCR"]) or ("Dr" if signed_amount < 0 else "Cr")
-        dr_cr = first_non_empty_text(elem, ["TXMLDRCR", "DRCR"]) or dr_cr
-        debit_amount = to_decimal(first_non_empty_text(elem, ["TXMLDEBITAMOUNT", "DEBITAMOUNT"]))
-        credit_amount = to_decimal(first_non_empty_text(elem, ["TXMLCREDITAMOUNT", "CREDITAMOUNT"]))
-        if debit_amount == 0 and credit_amount == 0:
-            debit_amount = base_amount if signed_amount < 0 else Decimal("0.00")
-            credit_amount = base_amount if signed_amount > 0 else Decimal("0.00")
+        base_amount = abs(raw_amount or amount_value)
+        is_debit = direct_child_text(elem, "ISDEEMEDPOSITIVE").upper() == "YES" or raw_amount < 0
+        signed_amount = base_amount * (Decimal("-1") if is_debit else Decimal("1"))
+        dr_cr = "Dr" if signed_amount < 0 else "Cr"
+        debit_amount = base_amount if signed_amount < 0 else Decimal("0.00")
+        credit_amount = base_amount if signed_amount > 0 else Decimal("0.00")
 
         meta = ledger_meta.get(ledger_name, {})
         primary_group = first_non_empty_text(elem, ["TXMLENTRYPRIMARYGROUP", "ENTRYPRIMARYGROUP", "PRIMARYGROUP"]) or meta.get("PrimaryGroup", "")

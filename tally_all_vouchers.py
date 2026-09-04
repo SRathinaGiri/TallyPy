@@ -511,8 +511,8 @@ def parse_voucher_rows(root, ledger_meta, company, from_date, to_date, vtype_map
             if not ledger_name or amount_value == 0:
                 continue
 
-            is_positive = direct_child_text(entry, "ISDEEMEDPOSITIVE").upper() == "YES"
-            signed_amount = abs(amount_value) * (Decimal("-1") if is_positive else Decimal("1"))
+            is_debit = direct_child_text(entry, "ISDEEMEDPOSITIVE").upper() == "YES" or amount_value < 0
+            signed_amount = abs(amount_value) * (Decimal("-1") if is_debit else Decimal("1"))
             meta = ledger_meta.get(ledger_name, {})
 
             rows.append({

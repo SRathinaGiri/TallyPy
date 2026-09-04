@@ -1,0 +1,308 @@
+;; Add Custom Report to Gateway of Tally
+[#Menu: Gateway of Tally]
+    Add : Item : "Power Tally BI TDL" : Display : CustomVoucherDetailsReport
+
+;; Report Definition
+[Report: CustomVoucherDetailsReport]
+    Form   : CustomVoucherDetailsForm
+    Title  : "Voucher and Ledger Details Report"
+    Set    : SV From Date : $_ThisYearBeg:Company:##SVCurrentCompany
+    Set    : SV To Date   : $_ThisYearEnd:Company:##SVCurrentCompany
+	
+;; Form Definition
+[Form: CustomVoucherDetailsForm]
+    Part    : CustomVoucherDetailsPart
+    Height  : 100% Page
+    Width   : 100% Page
+    Buttons : ExportButton, RefreshButton
+
+;; Part Definition
+[Part: CustomVoucherDetailsPart]
+    Line     : CustomVoucherDetailsTitle, CustomVoucherDetailsLine
+    Repeat   : CustomVoucherDetailsLine : _All_Vouchers
+    Scroll   : Vertical
+    Common Border : Yes
+
+;; Title Line (Header)
+[Line: CustomVoucherDetailsTitle]
+    Field   : CustomDateTitle, CustomVoucherTypeTitle, CustomVoucherNumberTitle, CustomLedgerNameTitle, CustomAmountTitle, CustomDrCrTitle, DebitAmountTitle, CreditAmountTitle, CustomPartyLedNameTitle, CustomParentGroupTitle, VoucherNarrationTitle, VoucherGSTINTitle, LedgerGSTINTitle, CustomBillRefTitle, CustomBillTypeTitle, CustomPrimaryGroupTitle, CustomNatureTitle, CustomOptionalTitle, CustomMasterID
+    Border  : Thin Bottom
+
+    [Field: CustomDateTitle]
+        Use     : Name Field
+        Set As  : "Date"
+        Width   : 15
+
+    [Field: CustomVoucherTypeTitle]
+        Use     : Name Field
+        Set As  : "Voucher Type"
+        Width   : 15
+
+    [Field: CustomVoucherNumberTitle]
+        Use     : Name Field
+        Set As  : "Voucher Number"
+        Width   : 15
+
+    [Field: CustomLedgerNameTitle]
+        Use     : Name Field
+        Set As  : "Ledger Name"
+        Width   : 20
+
+    [Field: CustomAmountTitle]
+        Use     : Name Field
+        Set As  : "Amount"
+        Width   : 15
+        Align   : Center
+
+    [Field: CustomDrCrTitle]
+        Use     : Name Field
+        Set As  : "Dr/Cr"
+        Width   : 8
+        Align   : Center
+		
+    [Field: DebitAmountTitle]
+        Use     : Name Field
+        Set As  : "Debit Amount"
+        Width   : 15
+        Align   : Right
+
+    [Field: CreditAmountTitle]
+        Use     : Name Field
+        Set As  : "Credit Amount"
+        Width   : 15
+        Align   : Right
+
+    [Field: CustomPartyLedNameTitle]
+        Use     : Name Field
+        Set As  : "Party Ledger Name"
+        Width   : 20
+
+    [Field: CustomParentGroupTitle]
+        Use     : Name Field
+        Set As  : "Parent Ledger"
+        Width   : 20
+
+    [Field: VoucherNarrationTitle]
+        Use     : Name Field
+        Set As  : "Voucher Narration"
+        Width   : 25
+
+    [Field: VoucherGSTINTitle]
+        Use     : Name Field
+        Set As  : "Voucher GSTIN"
+        Width   : 15
+
+    [Field: LedgerGSTINTitle]
+        Use     : Name Field
+        Set As  : "Ledger GSTIN"
+        Width   : 15
+
+    [Field: CustomBillRefTitle]
+        Use     : Name Field
+        Set As  : "Bill Ref"
+        Width   : 20
+
+    [Field: CustomBillTypeTitle]
+        Use     : Name Field
+        Set As  : "Bill Type"
+        Width   : 20
+
+    [Field: CustomPrimaryGroupTitle]
+        Use     : Name Field
+        Set As  : "Primary Group"
+        Width   : 20
+
+    [Field: CustomNatureTitle]
+        Use     : Name Field
+        Set As  : "Nature"
+        Width   : 20
+
+    [Field: CustomOptionalTitle]
+        Use     : Name Field
+        Set As  : "Optional"
+        Width   : 8
+
+    [Field: CustomMasterID]
+        Use     : Name Field
+        Set As  : "MasterID"
+        Width   : 8
+        Align   : Center
+		
+
+;; Data Line for Vouchers
+[Line: CustomVoucherDetailsLine]
+    Fields  : CustomDateField, CustomVoucherTypeField, CustomVoucherNumberField, CustomLedgerNameField, CustomAmountField, CustomDrCrField, CustomDebitField, CustomCreditField, CustomPartyLedNameField, CustomParentGroupField,  CustomNarrationField, CustomVrGSTIN, CustomLedgerGSTIN, CustomBillRefField, CustomBillTypeField, CustomPrimaryGroup, CustomNatureField, CustomOptionalField, CustomMasterIDField
+    Space Bottom: 0.5
+
+    [Field: CustomDateField]
+        Use     : Uni Date Field
+        Set As  : $Date
+        Width   : 15
+
+    [Field: CustomVoucherTypeField]
+        Use     : Name Field
+        Set As  : $VoucherTypeName
+        Width   : 15
+
+    [Field: CustomVoucherNumberField]
+        Use     : Name Field
+        Set As  : $VoucherNumber
+        Width   : 15
+
+    [Field: CustomLedgerNameField]
+        Use     : Name Field
+        Set As  : $LedgerName
+        Width   : 20
+
+    [Field: CustomAmountField]
+        Use     : Amount Forex Field
+        Set As  : If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount * -1 Else $$Abs:$Amount
+        Width   : 15
+        Align   : Right
+
+    [Field: CustomDrCrField]
+        Use     : Name Field
+        Set As  : If ($IsDeemedPositive OR $Amount < 0) Then "Dr" Else "Cr"
+        Width   : 8
+        Align   : Center
+
+    [Field: CustomDebitField]
+        Use     : Amount Forex Field
+        Set As  : If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount Else 0
+        Width   : 15
+        Align   : Right
+		
+    [Field: CustomCreditField]
+        Use     : Amount Forex Field
+        Set As  : If ($IsDeemedPositive OR $Amount < 0) Then 0 Else $$Abs:$Amount
+        Width   : 15
+        Align   : Right
+
+
+    [Field: CustomPartyLedNameField]
+        Use     : Name Field
+        Set As  : If NOT $$IsEmpty:$PartyLedgerName Then $PartyLedgerName Else "N/A"
+        Width   : 20
+
+    [Field: CustomParentGroupField]
+        Use     : Name Field
+        Set As  : $Parent:Ledger:$LedgerName
+        Width   : 20
+
+    [Field: CustomNarrationField]
+        Use     : Name Field
+        Set As  : $VoucherNarration
+        Width   : 25
+
+    [Field: CustomVrGSTIN]
+        Use     : Name Field
+        Set As  : $PartyGSTIN
+        Width   : 15
+
+    [Field: CustomLedgerGSTIN]
+        Use     : Name Field
+        Set As  : $PartyGSTIN:Ledger:$LedgerName
+        Width   : 15
+				
+    [Field: CustomBillRefField]
+        Use     : Name Field
+        Set As  : $BillAllocations.Name
+        Width   : 20
+
+    [Field: CustomBillTypeField]
+        Use     : Name Field
+        Set As  : $BillAllocations.BillType
+        Width   : 20
+		
+    [Field: CustomPrimaryGroup]
+        Use     : Name Field
+        Set As  : $_PrimaryGroup:Ledger:$LedgerName
+        Width   : 20
+
+    [Field: CustomNatureField]
+        Use     : Name Field
+        Set As  : If (($_PrimaryGroup:Ledger:$LedgerName = "Bank Accounts") OR ($_PrimaryGroup:Ledger:$LedgerName = "Bank OD A/c") OR ($_PrimaryGroup:Ledger:$LedgerName = "Capital Account") OR  ($_PrimaryGroup:Ledger:$LedgerName = "Cash-in-Hand") OR ($_PrimaryGroup:Ledger:$LedgerName = "Current Assets") OR ($_PrimaryGroup:Ledger:$LedgerName = "Deposits (Asset)") OR ($_PrimaryGroup:Ledger:$LedgerName = "Fixed Assets") OR ($_PrimaryGroup:Ledger:$LedgerName = "Investments") OR ($_PrimaryGroup:Ledger:$LedgerName = "Loans & Advances (Asset)") OR ($_PrimaryGroup:Ledger:$LedgerName = "Loans (Liability)") OR ($_PrimaryGroup:Ledger:$LedgerName = "Provisions") OR ($_PrimaryGroup:Ledger:$LedgerName = "Secured Loans") OR ($_PrimaryGroup:Ledger:$LedgerName = "Sundry Creditors") OR ($_PrimaryGroup:Ledger:$LedgerName = "Sundry Debtors")) Then "BS" Else IF (($_PrimaryGroup:Ledger:$LedgerName = "Direct Expenses") OR  ($_PrimaryGroup:Ledger:$LedgerName = "Duties & Taxes") OR ($_PrimaryGroup:Ledger:$LedgerName = "Indirect Expenses") OR ($_PrimaryGroup:Ledger:$LedgerName = "Indirect Incomes") OR ($_PrimaryGroup:Ledger:$LedgerName = "Purchase Accounts") OR ($_PrimaryGroup:Ledger:$LedgerName = "Sales Accounts")) THEN "PL"	ELSE "Unknown"
+        Width   : 20
+		
+    [Field: CustomOptionalField]
+        Use     : Name Field
+        Set As  : If $IsOptional Then "Yes" Else "No"
+        Width   : 8
+        Align   : Center
+
+    [Field: CustomMasterIDField]
+        Use     : Name Field
+        Set As  : $MasterID:Ledger:$LedgerName
+        Width   : 8
+        Align   : Center
+		
+
+[Collection: _All_Vouchers]
+    Source Collection : AllVouchersForODBC
+    Walk              : All Ledger Entries
+    Fetch             : Date, VoucherTypeName, VoucherNumber, LedgerName, Amount, IsDeemedPositive, PartyLedgerName, PartyGSTIN,  BillAllocations.Name, BillAllocations.BillType, VoucherNarration, IsOptional
+    Compute           : DebitAmount : If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount Else 0
+    Compute           : CreditAmount : If ($IsDeemedPositive OR $Amount < 0) Then 0 Else $$Abs:$Amount
+    Compute           : DrCr : If ($IsDeemedPositive OR $Amount < 0) Then "Dr" Else "Cr"
+    Compute           : ParentLedger : $Parent:Ledger:$LedgerName
+    Compute           : PrimaryGroup : $_PrimaryGroup:Ledger:$LedgerName
+    Compute           : LedMasterID : $MasterID:Ledger:$LedgerName
+    Compute           : BillRef : $BillAllocations.Name
+    Compute           : BillType : $BillAllocations.BillType
+	Compute           : LedgerGSTIN: $PartyGSTIN:Ledger:$LedgerName
+	Compute           : StatusOptional : If $IsOptional Then "Yes" Else "No"
+	Compute           : Nature : If (($_PrimaryGroup:Ledger:$LedgerName = "Bank Accounts") OR ($_PrimaryGroup:Ledger:$LedgerName = "Bank OD A/c") OR ($_PrimaryGroup:Ledger:$LedgerName = "Capital Account") OR  ($_PrimaryGroup:Ledger:$LedgerName = "Cash-in-Hand") OR ($_PrimaryGroup:Ledger:$LedgerName = "Current Assets") OR ($_PrimaryGroup:Ledger:$LedgerName = "Deposits (Asset)") OR ($_PrimaryGroup:Ledger:$LedgerName = "Fixed Assets") OR ($_PrimaryGroup:Ledger:$LedgerName = "Investments") OR ($_PrimaryGroup:Ledger:$LedgerName = "Loans & Advances (Asset)") OR ($_PrimaryGroup:Ledger:$LedgerName = "Loans (Liability)") OR ($_PrimaryGroup:Ledger:$LedgerName = "Provisions") OR ($_PrimaryGroup:Ledger:$LedgerName = "Secured Loans") OR ($_PrimaryGroup:Ledger:$LedgerName = "Sundry Creditors") OR ($_PrimaryGroup:Ledger:$LedgerName = "Sundry Debtors")) Then "BS" Else "PL"	
+	Compute           : CompanyName: ##SVCurrentCompany
+	Compute : FromDate : If $$IsEmpty:##SVFromDate Then $_ThisYearBeg:Company:##SVCurrentCompany Else ##SVFromDate
+	Compute : ToDate   : If $$IsEmpty:##SVToDate Then $_ThisYearEnd:Company:##SVCurrentCompany Else ##SVToDate	
+	Filter            : IsAccountingVoucher
+    Is ODBCTable      : Yes
+	
+;; Filter for Accounting Vouchers
+[System: Formula]
+    IsAccountingVoucher : ($VoucherTypeName = "Sales") OR ($VoucherTypeName = "Purchase") OR                           ($VoucherTypeName = "Journal") OR ($VoucherTypeName = "Receipt") OR ($VoucherTypeName = "Payment") OR       ($VoucherTypeName = "Debit Note") OR ($VoucherTypeName = "Credit Note")
+
+[System: Formula]
+	VoucherNarration  : $Narration:Voucher
+
+
+[Collection: NonAccountingAllLedgerCollection]
+    Source Collection : AllVouchersForODBC
+    Walk              : All Ledger Entries
+    Fetch             : Date, VoucherTypeName, VoucherNumber, LedgerName, Amount, IsDeemedPositive, PartyLedgerName, PartyGSTIN,  BillAllocations.Name, BillAllocations.BillType, VoucherNarration, IsOptional
+    Compute           : DebitAmount : If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount Else 0
+    Compute           : CreditAmount : If ($IsDeemedPositive OR $Amount < 0) Then 0 Else $$Abs:$Amount
+    Compute           : DrCr : If ($IsDeemedPositive OR $Amount < 0) Then "Dr" Else "Cr"
+    Compute           : ParentLedger : $Parent:Ledger:$LedgerName
+    Compute           : PrimaryGroup : $_PrimaryGroup:Ledger:$LedgerName
+    Compute           : LedMasterID  : $MasterID:Ledger:$LedgerName
+    Compute           : BillRef : $BillAllocations.Name
+    Compute           : BillType : $BillAllocations.BillType
+	Compute           : LedgerGSTIN: $PartyGSTIN:Ledger:$LedgerName
+	Compute           : CompanyName: ##SVCurrentCompany
+    Compute           : FromDate: $$YearStart:##SVCurrentDate
+    Compute           : ToDate: $$YearEnd:##SVCurrentDate
+	
+    Filter            : IsMiscVoucher
+    Is ODBCTable      : Yes
+	
+
+;; Filter for Non-Accounting Vouchers
+[System: Formula]
+    IsMiscVoucher : NOT (($VoucherTypeName = "Sales") OR ($VoucherTypeName = "Purchase") OR         ($VoucherTypeName = "Journal") OR ($VoucherTypeName = "Receipt") OR ($VoucherTypeName = "Payment") OR ($VoucherTypeName = "Debit Note") OR ($VoucherTypeName = "Credit Note"))
+
+
+[Collection: All_Vouchers]
+    Source Collection : _All_Vouchers
+    Fetch             : Date, VoucherTypeName, VoucherNumber, LedgerName, MasterID, Amount, DrCr, DebitAmount, CreditAmount, ParentLedger, PrimaryGroup, PartyLedgerName, PartyGSTIN, LedgerGSTIN, VoucherNarration, BillRef, BillType, IsOptional, CompanyName, FromDate, ToDate
+    Is ODBCTable      : No
+	
+	
+;; Collection for ODBC
+[Collection: AllVouchersForODBC]
+    Type        : Voucher
+    Fetch       : Date, VoucherTypeName, VoucherNumber, Narration, MasterID
+   Compute     : LedMasterID     : $MasterID 
+	Compute     : VoucherNarration: $Narration
+    Is ODBCTable: No 
+

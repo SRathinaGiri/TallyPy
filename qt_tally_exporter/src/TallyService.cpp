@@ -1043,10 +1043,10 @@ QString buildFlatVoucherRequestXml(const QString &company, const QString &fromDa
         "<COMPUTE>TXMLPartyLedgerName:If NOT $$IsEmpty:$..PartyLedgerName Then $..PartyLedgerName Else \"N/A\"</COMPUTE>"
         "<COMPUTE>TXMLPartyGSTIN:$..PartyGSTIN</COMPUTE>"
         "<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
-        "<COMPUTE>TXMLSignedAmount:If $IsDeemedPositive Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
-        "<COMPUTE>TXMLDebitAmount:If $IsDeemedPositive Then $$Abs:$Amount Else 0</COMPUTE>"
-        "<COMPUTE>TXMLCreditAmount:If $IsDeemedPositive Then 0 Else $$Abs:$Amount</COMPUTE>"
-        "<COMPUTE>TXMLDrCr:If $IsDeemedPositive Then \"Dr\" Else \"Cr\"</COMPUTE>"
+        "<COMPUTE>TXMLSignedAmount:If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDebitAmount:If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount Else 0</COMPUTE>"
+        "<COMPUTE>TXMLCreditAmount:If ($IsDeemedPositive OR $Amount < 0) Then 0 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDrCr:If ($IsDeemedPositive OR $Amount < 0) Then \"Dr\" Else \"Cr\"</COMPUTE>"
         "<COMPUTE>TXMLEntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
         "<COMPUTE>TXMLEntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
         "<COMPUTE>TXMLEntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
@@ -1312,24 +1312,20 @@ QVector<QVariantMap> parseFlatVouchers(const QDomDocument &doc, const QMap<QStri
         for (int i = 0; i < flatNodes.size(); ++i) {
             const QDomElement entry = flatNodes.at(i).toElement();
             const QString ledgerName = directChildText(entry, "LEDGERNAME");
-            double signedAmount = toDoubleValue(firstNonEmptyText(entry, {"TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT", "AMOUNT"}));
-            if (ledgerName.isEmpty() || std::abs(signedAmount) < 0.0000001) {
+            const double rawAmount = toDoubleValue(directChildText(entry, "AMOUNT"));
+            double amountValue = toDoubleValue(firstNonEmptyText(entry, {"TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT", "AMOUNT"}));
+            if (ledgerName.isEmpty() || (std::abs(amountValue) < 0.0000001 && std::abs(rawAmount) < 0.0000001)) {
                 continue;
             }
-            const double baseAmount = std::abs(signedAmount);
-            if (firstNonEmptyText(entry, {"TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT"}).isEmpty()) {
-                signedAmount = directChildText(entry, "ISDEEMEDPOSITIVE").toUpper() == "YES" ? -baseAmount : baseAmount;
-            }
+            const double baseAmount = std::abs(std::abs(rawAmount) >= 0.0000001 ? rawAmount : amountValue);
+            const bool isDebit = directChildText(entry, "ISDEEMEDPOSITIVE").toUpper() == "YES" || rawAmount < 0;
+            const double signedAmount = isDebit ? -baseAmount : baseAmount;
 
             const QString voucherType = canonicalVoucherTypeName(firstNonEmptyText(entry, {"TXMLVOUCHERTYPENAME", "VOUCHERTYPENAME"}));
             const QString baseType = canonicalVoucherTypeName(vtypeMap.value(voucherType, voucherType));
             const QString voucherCategory = voucherCategoryFromBaseType(baseType);
-            double debitAmount = toDoubleValue(firstNonEmptyText(entry, {"TXMLDEBITAMOUNT", "DEBITAMOUNT"}));
-            double creditAmount = toDoubleValue(firstNonEmptyText(entry, {"TXMLCREDITAMOUNT", "CREDITAMOUNT"}));
-            if (std::abs(debitAmount) < 0.0000001 && std::abs(creditAmount) < 0.0000001) {
-                debitAmount = signedAmount < 0 ? baseAmount : 0.0;
-                creditAmount = signedAmount > 0 ? baseAmount : 0.0;
-            }
+            const double debitAmount = signedAmount < 0 ? baseAmount : 0.0;
+            const double creditAmount = signedAmount > 0 ? baseAmount : 0.0;
 
             QVariantMap meta = ledgerMeta.value(ledgerName);
             QString primaryGroup = firstNonEmptyText(entry, {"TXMLENTRYPRIMARYGROUP", "ENTRYPRIMARYGROUP", "PRIMARYGROUP"});
@@ -1359,7 +1355,7 @@ QVector<QVariantMap> parseFlatVouchers(const QDomDocument &doc, const QMap<QStri
                                        ? meta.value("MasterID").toString()
                                        : firstNonEmptyText(entry, {"TXMLENTRYLEDGERMASTERID", "ENTRYLEDGERMASTERID", "LEDMASTERID"}));
             row.insert("Amount", numberToString(signedAmount));
-            row.insert("DrCr", firstNonEmptyText(entry, {"TXMLDRCR", "DRCR"}).isEmpty() ? (signedAmount < 0 ? "Dr" : "Cr") : firstNonEmptyText(entry, {"TXMLDRCR", "DRCR"}));
+            row.insert("DrCr", signedAmount < 0 ? "Dr" : "Cr");
             row.insert("DebitAmount", numberToString(debitAmount));
             row.insert("CreditAmount", numberToString(creditAmount));
             row.insert("ParentLedger", firstNonEmptyText(entry, {"TXMLENTRYPARENTLEDGER", "ENTRYPARENTLEDGER", "PARENTLEDGER"}).isEmpty()
