@@ -2,7 +2,15 @@
 
 Native Qt Widgets desktop app for exporting Tally data to CSV using the same XML request and parsing flow as the Python exporter.
 
-Current release version: `0.1.9`
+Current release version: `0.1.10`
+
+Version 0.1.10 fixes malformed voucher-request XML, accepts flat ledger rows by
+their fields, and reports Tally rejection responses instead of treating them as
+empty exports. Older cached responses are bypassed automatically.
+
+Regression checks are built as `TallyServiceTests.exe`. Run them with the Qt and
+MinGW runtime folders on PATH; add `--live` to check one day of vouchers from the
+active company on localhost:9000. The live check only reads Tally data.
 
 ## Build
 
@@ -43,7 +51,7 @@ build_installer.bat
 
 This creates:
 
-`dist\TallyQtExporter_Setup_v0.1.9.exe`
+`dist\TallyQtExporter_Setup_v0.1.10.exe`
 
 The installer copies the app to `C:\Program Files\Tally Qt Exporter` and creates Desktop and Start Menu shortcuts.
 

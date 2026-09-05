@@ -269,6 +269,18 @@ QDomDocument parseXmlRoot(const QString &xmlText) {
                                      .arg(errorMsg)
                                      .toStdString());
     }
+    const auto errors = doc.elementsByTagName("LINEERROR");
+    const auto statuses = doc.elementsByTagName("STATUS");
+    const QString error = errors.isEmpty() ? QString() : errors.at(0).toElement().text().trimmed();
+    const bool failed = !statuses.isEmpty() && statuses.at(0).toElement().text().trimmed() == "0";
+    const bool plainResponse = doc.documentElement().tagName() == "RESPONSE"
+        && doc.documentElement().firstChildElement().isNull()
+        && !doc.documentElement().text().trimmed().isEmpty();
+    if (!error.isEmpty() || failed || plainResponse) {
+        const QString reason = !error.isEmpty() ? error
+            : plainResponse ? doc.documentElement().text().trimmed() : QString("STATUS=0");
+        throw std::runtime_error(QString("Tally rejected the request: %1").arg(reason).toStdString());
+    }
     return doc;
 }
 
@@ -760,7 +772,7 @@ QString cacheFilePath(const QString &company, const QString &tableName, const Ex
         cacheRoot += "/tally_xml";
     }
     const QString keyText = cleanText(company) + "|" + tableName + "|" + cleanText(chunk.fromDate) + "|" + cleanText(chunk.toDate)
-        + "|" + QString::number(chunk.masterFrom) + "|" + QString::number(chunk.masterTo) + "|xml-v6";
+        + "|" + QString::number(chunk.masterFrom) + "|" + QString::number(chunk.masterTo) + "|xml-v7";
     const QString fileName = QString(QCryptographicHash::hash(keyText.toUtf8(), QCryptographicHash::Sha1).toHex()) + ".xml";
     return QDir(cacheRoot).filePath(fileName);
 }
@@ -777,6 +789,7 @@ QString fetchXmlCached(const QString &url, const QString &xmlText, const QString
     for (int attempt = 0; attempt < 3; ++attempt) {
         try {
             const QString xml = postToTally(url, xmlText);
+            parseXmlRoot(xml); // Never cache an error response as successful export data.
             QDir().mkpath(QFileInfo(path).absolutePath());
             QFile file(path);
             if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -1043,10 +1056,10 @@ QString buildFlatVoucherRequestXml(const QString &company, const QString &fromDa
         "<COMPUTE>TXMLPartyLedgerName:If NOT $$IsEmpty:$..PartyLedgerName Then $..PartyLedgerName Else \"N/A\"</COMPUTE>"
         "<COMPUTE>TXMLPartyGSTIN:$..PartyGSTIN</COMPUTE>"
         "<COMPUTE>TXMLVoucherNarration:$..Narration</COMPUTE>"
-        "<COMPUTE>TXMLSignedAmount:If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
-        "<COMPUTE>TXMLDebitAmount:If ($IsDeemedPositive OR $Amount < 0) Then $$Abs:$Amount Else 0</COMPUTE>"
-        "<COMPUTE>TXMLCreditAmount:If ($IsDeemedPositive OR $Amount < 0) Then 0 Else $$Abs:$Amount</COMPUTE>"
-        "<COMPUTE>TXMLDrCr:If ($IsDeemedPositive OR $Amount < 0) Then \"Dr\" Else \"Cr\"</COMPUTE>"
+        "<COMPUTE>TXMLSignedAmount:If ($IsDeemedPositive OR $Amount &lt; 0) Then $$Abs:$Amount * -1 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDebitAmount:If ($IsDeemedPositive OR $Amount &lt; 0) Then $$Abs:$Amount Else 0</COMPUTE>"
+        "<COMPUTE>TXMLCreditAmount:If ($IsDeemedPositive OR $Amount &lt; 0) Then 0 Else $$Abs:$Amount</COMPUTE>"
+        "<COMPUTE>TXMLDrCr:If ($IsDeemedPositive OR $Amount &lt; 0) Then \"Dr\" Else \"Cr\"</COMPUTE>"
         "<COMPUTE>TXMLEntryLedgerMasterID:$MasterID:Ledger:$LedgerName</COMPUTE>"
         "<COMPUTE>TXMLEntryParentLedger:$Parent:Ledger:$LedgerName</COMPUTE>"
         "<COMPUTE>TXMLEntryPrimaryGroup:$_PrimaryGroup:Ledger:$LedgerName</COMPUTE>"
@@ -1307,10 +1320,17 @@ QVector<QVariantMap> parseFlatVouchers(const QDomDocument &doc, const QMap<QStri
     QVector<QVariantMap> rows;
     const QString formattedFromDate = formatTallyDate(fromDate);
     const QString formattedToDate = formatTallyDate(toDate);
-    QDomNodeList flatNodes = doc.elementsByTagName("LEDGERENTRY");
+    // Walked collection rows can have different element names across Tally versions.
+    // Identify each row by its direct fields, as the Python exporter does.
+    QList<QDomElement> flatNodes{doc.documentElement()};
+    for (int i = 0; i < flatNodes.size(); ++i) {
+        for (auto child = flatNodes.at(i).firstChildElement(); !child.isNull(); child = child.nextSiblingElement()) {
+            flatNodes.append(child);
+        }
+    }
     if (!flatNodes.isEmpty()) {
         for (int i = 0; i < flatNodes.size(); ++i) {
-            const QDomElement entry = flatNodes.at(i).toElement();
+            const QDomElement entry = flatNodes.at(i);
             const QString ledgerName = directChildText(entry, "LEDGERNAME");
             const double rawAmount = toDoubleValue(directChildText(entry, "AMOUNT"));
             double amountValue = toDoubleValue(firstNonEmptyText(entry, {"TXMLSIGNEDAMOUNT", "SIGNEDAMOUNT", "AMOUNT"}));

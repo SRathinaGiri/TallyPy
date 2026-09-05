@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(TallyQtExporter VERSION 0.1.9 LANGUAGES CXX)
+project(TallyQtExporter VERSION 0.1.10 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,3 +37,10 @@ set_target_properties(TallyQtExporter PROPERTIES
 )
 
 install(TARGETS TallyQtExporter RUNTIME DESTINATION .)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(TallyServiceTests tests/TallyServiceTests.cpp)
+    target_link_libraries(TallyServiceTests PRIVATE Qt6::Core Qt6::Network Qt6::Xml)
+    add_test(NAME TallyServiceTests COMMAND TallyServiceTests)
+endif()
