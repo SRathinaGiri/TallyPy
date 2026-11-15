@@ -50,6 +50,10 @@ the complete datasets into grid controls. Voucher and inventory requests are
 split by calendar month to keep Tally responses manageable. CSV files are
 UTF-8 with a BOM and are streamed to disk row-by-row.
 
+The first tab summarizes row counts for all five datasets and shows Amount,
+Debit Amount, Credit Amount, and Debit minus Credit totals for Vouchers and
+All Vouchers.
+
 ## Native deployment
 
 Copy only `TallyExporter.exe` to another Windows 10/11 computer. The executable

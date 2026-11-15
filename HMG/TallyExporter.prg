@@ -1,6 +1,7 @@
 #include "hmg.ch"
 
 #define APP_TITLE "Tally HMG Exporter"
+#define APP_VERSION "1.0.1"
 #define PROJECT_URL "https://github.com/SRathinaGiri/TallyPy/tree/main/HMG"
 STATIC s_hBundle := {=>}
 STATIC s_lBusy := .F.
@@ -55,6 +56,39 @@ FUNCTION Main()
          WIDTH 1220 ;
          HEIGHT 430 ;
          ON CHANGE RefreshActiveVirtualGrid()
+
+         PAGE "Summary"
+            @ 35, 10 FRAME FrameCounts CAPTION "Counts" WIDTH 250 HEIGHT 330
+            @ 72, 30 LABEL LblCountVouchers VALUE "Vouchers" WIDTH 120 HEIGHT 24 FONT "Segoe UI" SIZE 11
+            @ 68, 155 LABEL ValCountVouchers VALUE "0" WIDTH 80 HEIGHT 30 FONT "Segoe UI" SIZE 18 BOLD RIGHTALIGN
+            @ 122, 30 LABEL LblCountAllVouchers VALUE "All Vouchers" WIDTH 120 HEIGHT 24 FONT "Segoe UI" SIZE 11
+            @ 118, 155 LABEL ValCountAllVouchers VALUE "0" WIDTH 80 HEIGHT 30 FONT "Segoe UI" SIZE 18 BOLD RIGHTALIGN
+            @ 172, 30 LABEL LblCountLedgers VALUE "Ledgers" WIDTH 120 HEIGHT 24 FONT "Segoe UI" SIZE 11
+            @ 168, 155 LABEL ValCountLedgers VALUE "0" WIDTH 80 HEIGHT 30 FONT "Segoe UI" SIZE 18 BOLD RIGHTALIGN
+            @ 222, 30 LABEL LblCountStock VALUE "Stock Items" WIDTH 120 HEIGHT 24 FONT "Segoe UI" SIZE 11
+            @ 218, 155 LABEL ValCountStock VALUE "0" WIDTH 80 HEIGHT 30 FONT "Segoe UI" SIZE 18 BOLD RIGHTALIGN
+            @ 272, 30 LABEL LblCountInventory VALUE "Stock Vouchers" WIDTH 120 HEIGHT 24 FONT "Segoe UI" SIZE 11
+            @ 268, 155 LABEL ValCountInventory VALUE "0" WIDTH 80 HEIGHT 30 FONT "Segoe UI" SIZE 18 BOLD RIGHTALIGN
+
+            @ 35, 275 FRAME FrameAccounting CAPTION "Accounting Totals" WIDTH 915 HEIGHT 330
+            @ 72, 300 LABEL LblTotalTable VALUE "Table" WIDTH 130 HEIGHT 24 FONT "Segoe UI" SIZE 11 BOLD
+            @ 72, 430 LABEL LblTotalAmount VALUE "Amount" WIDTH 165 HEIGHT 24 FONT "Segoe UI" SIZE 11 BOLD RIGHTALIGN
+            @ 72, 605 LABEL LblTotalDebit VALUE "Debit Amount" WIDTH 165 HEIGHT 24 FONT "Segoe UI" SIZE 11 BOLD RIGHTALIGN
+            @ 72, 780 LABEL LblTotalCredit VALUE "Credit Amount" WIDTH 165 HEIGHT 24 FONT "Segoe UI" SIZE 11 BOLD RIGHTALIGN
+            @ 72, 955 LABEL LblTotalBalance VALUE "Debit - Credit" WIDTH 165 HEIGHT 24 FONT "Segoe UI" SIZE 11 BOLD RIGHTALIGN
+
+            @ 130, 300 LABEL LblVoucherTotals VALUE "Vouchers" WIDTH 130 HEIGHT 30 FONT "Segoe UI" SIZE 12
+            @ 124, 430 LABEL ValVoucherAmount VALUE "0.00" WIDTH 165 HEIGHT 36 FONT "Segoe UI" SIZE 16 BOLD RIGHTALIGN
+            @ 124, 605 LABEL ValVoucherDebit VALUE "0.00" WIDTH 165 HEIGHT 36 FONT "Segoe UI" SIZE 16 BOLD RIGHTALIGN
+            @ 124, 780 LABEL ValVoucherCredit VALUE "0.00" WIDTH 165 HEIGHT 36 FONT "Segoe UI" SIZE 16 BOLD RIGHTALIGN
+            @ 124, 955 LABEL ValVoucherBalance VALUE "0.00" WIDTH 165 HEIGHT 36 FONT "Segoe UI" SIZE 16 BOLD RIGHTALIGN
+
+            @ 205, 300 LABEL LblAllVoucherTotals VALUE "All Vouchers" WIDTH 130 HEIGHT 30 FONT "Segoe UI" SIZE 12
+            @ 199, 430 LABEL ValAllVoucherAmount VALUE "0.00" WIDTH 165 HEIGHT 36 FONT "Segoe UI" SIZE 16 BOLD RIGHTALIGN
+            @ 199, 605 LABEL ValAllVoucherDebit VALUE "0.00" WIDTH 165 HEIGHT 36 FONT "Segoe UI" SIZE 16 BOLD RIGHTALIGN
+            @ 199, 780 LABEL ValAllVoucherCredit VALUE "0.00" WIDTH 165 HEIGHT 36 FONT "Segoe UI" SIZE 16 BOLD RIGHTALIGN
+            @ 199, 955 LABEL ValAllVoucherBalance VALUE "0.00" WIDTH 165 HEIGHT 36 FONT "Segoe UI" SIZE 16 BOLD RIGHTALIGN
+         END PAGE
 
          PAGE "Vouchers"
             @ 35, 10 GRID GridVouchers WIDTH 1190 HEIGHT 340 ;
@@ -112,6 +146,7 @@ FUNCTION Main()
    END WINDOW
 
    MainForm.BtnCancel.Enabled := .F.
+   ResetSummary()
    CENTER WINDOW MainForm
    ACTIVATE WINDOW MainForm
 RETURN NIL
@@ -216,6 +251,7 @@ STATIC PROCEDURE LoadTables()
    IF hResult[ "ok" ]
       s_hBundle := hResult
       MainForm.TxtDetected.Value := hResult[ "company" ] + "  (" + FormatTallyDate( hResult[ "from" ] ) + " to " + FormatTallyDate( hResult[ "to" ] ) + ")"
+      UpdateSummary( hResult )
       RefreshActiveVirtualGrid()
       MainForm.LblSummary.Value := "Rows: vouchers " + NToC( Len( hResult[ "vouchers" ] ) ) + ;
          " | all vouchers " + NToC( Len( hResult[ "allvouchers" ] ) ) + ;
@@ -247,6 +283,10 @@ STATIC PROCEDURE RefreshActiveVirtualGrid()
       RETURN
    ENDIF
    nPage := MainForm.TabData.Value
+   IF nPage == 1
+      RETURN
+   ENDIF
+   nPage--
    IF nPage < 1 .OR. nPage > Len( aGrids )
       RETURN
    ENDIF
@@ -309,10 +349,70 @@ RETURN
 STATIC PROCEDURE ClearResults()
    s_hBundle := {=>}
    RefreshActiveVirtualGrid()
+   ResetSummary()
    MainForm.LblSummary.Value := "No data loaded"
    MainForm.TxtDetected.Value := ""
    LogMessage( "Results cleared." )
 RETURN
+
+STATIC PROCEDURE UpdateSummary( hResult )
+   LOCAL aVoucherTotals := SummarizeRows( hResult[ "vouchers" ] )
+   LOCAL aAllVoucherTotals := SummarizeRows( hResult[ "allvouchers" ] )
+
+   MainForm.ValCountVouchers.Value := FormatCount( Len( hResult[ "vouchers" ] ) )
+   MainForm.ValCountAllVouchers.Value := FormatCount( Len( hResult[ "allvouchers" ] ) )
+   MainForm.ValCountLedgers.Value := FormatCount( Len( hResult[ "ledgers" ] ) )
+   MainForm.ValCountStock.Value := FormatCount( Len( hResult[ "stock" ] ) )
+   MainForm.ValCountInventory.Value := FormatCount( Len( hResult[ "inventory" ] ) )
+
+   MainForm.ValVoucherAmount.Value := FormatSummaryAmount( aVoucherTotals[ 1 ] )
+   MainForm.ValVoucherDebit.Value := FormatSummaryAmount( aVoucherTotals[ 2 ] )
+   MainForm.ValVoucherCredit.Value := FormatSummaryAmount( aVoucherTotals[ 3 ] )
+   MainForm.ValVoucherBalance.Value := FormatSummaryAmount( aVoucherTotals[ 2 ] - aVoucherTotals[ 3 ] )
+   MainForm.ValAllVoucherAmount.Value := FormatSummaryAmount( aAllVoucherTotals[ 1 ] )
+   MainForm.ValAllVoucherDebit.Value := FormatSummaryAmount( aAllVoucherTotals[ 2 ] )
+   MainForm.ValAllVoucherCredit.Value := FormatSummaryAmount( aAllVoucherTotals[ 3 ] )
+   MainForm.ValAllVoucherBalance.Value := FormatSummaryAmount( aAllVoucherTotals[ 2 ] - aAllVoucherTotals[ 3 ] )
+RETURN
+
+STATIC PROCEDURE ResetSummary()
+   MainForm.ValCountVouchers.Value := "0"
+   MainForm.ValCountAllVouchers.Value := "0"
+   MainForm.ValCountLedgers.Value := "0"
+   MainForm.ValCountStock.Value := "0"
+   MainForm.ValCountInventory.Value := "0"
+   MainForm.ValVoucherAmount.Value := "0.00"
+   MainForm.ValVoucherDebit.Value := "0.00"
+   MainForm.ValVoucherCredit.Value := "0.00"
+   MainForm.ValVoucherBalance.Value := "0.00"
+   MainForm.ValAllVoucherAmount.Value := "0.00"
+   MainForm.ValAllVoucherDebit.Value := "0.00"
+   MainForm.ValAllVoucherCredit.Value := "0.00"
+   MainForm.ValAllVoucherBalance.Value := "0.00"
+RETURN
+
+STATIC FUNCTION SummarizeRows( aRows )
+   LOCAL aTotals := { 0.0, 0.0, 0.0 }, aRow
+   FOR EACH aRow IN aRows
+      IF Len( aRow ) >= 10
+         aTotals[ 1 ] += SummaryNumber( aRow[ 7 ] )
+         aTotals[ 2 ] += SummaryNumber( aRow[ 9 ] )
+         aTotals[ 3 ] += SummaryNumber( aRow[ 10 ] )
+      ENDIF
+   NEXT
+RETURN aTotals
+
+STATIC FUNCTION SummaryNumber( xValue )
+RETURN Val( StrTran( AllTrim( hb_CStr( xValue ) ), ",", "" ) )
+
+STATIC FUNCTION FormatCount( nValue )
+RETURN LTrim( Transform( nValue, "999,999,999,999" ) )
+
+STATIC FUNCTION FormatSummaryAmount( nValue )
+   IF Abs( nValue ) < 0.0000001
+      nValue := 0
+   ENDIF
+RETURN LTrim( Transform( nValue, "999,999,999,999,999.99" ) )
 
 STATIC PROCEDURE ShowAbout()
    DEFINE WINDOW AboutForm ;
@@ -324,7 +424,7 @@ STATIC PROCEDURE ShowAbout()
       NOSIZE
 
       @ 0, 0 IMAGE ImgAboutSplash PICTURE "SPLASH" WIDTH 900 HEIGHT 300 STRETCH
-      @ 312, 20 LABEL LblAboutTitle VALUE APP_TITLE + " 1.0.0" WIDTH 860 HEIGHT 24 CENTERALIGN BOLD
+      @ 312, 20 LABEL LblAboutTitle VALUE APP_TITLE + " " + APP_VERSION WIDTH 860 HEIGHT 24 CENTERALIGN BOLD
       @ 338, 20 LABEL LblAboutDetails ;
          VALUE "Native HMG/Harbour exporter using WinHTTP, MSXML and TDL-injected exports." ;
          WIDTH 860 HEIGHT 24 CENTERALIGN
