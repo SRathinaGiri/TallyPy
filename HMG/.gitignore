@@ -1,0 +1,5 @@
+*.exe
+*.log
+*.out
+*.err
+*_result.txt

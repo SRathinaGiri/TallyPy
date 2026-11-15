@@ -1,0 +1,11 @@
+# HMG IDE project build options.
+# TallyExporter.prg is the first module in TallyExporter.hbp and owns Main().
+inc=yes
+head=native
+mt=no
+instpaths=
+incpaths=
+libpaths=
+libs=
+syslibs=winhttp
+gt=

@@ -1,0 +1,6 @@
+TallyExporter.prg
+tally_service.prg
+tally_http.c
+
+-lwinhttp
+

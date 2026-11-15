@@ -1,0 +1,3 @@
+MAINICON ICON "../qt_tally_exporter/assets/app_icon.ico"
+SPLASH   PNG  "assets/tally_xml_exporter_splash.png"
+

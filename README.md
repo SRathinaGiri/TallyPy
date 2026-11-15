@@ -19,6 +19,8 @@ TallyPy is a robust Python-based suite designed to extract accounting and invent
 - `tally_stock_items.py`: Extractor for Stock Item masters.
 - `tally_stock_vouchers.py`: Extractor for Inventory transactions (Stock Ledgers).
 - `requirements.txt`: List of Python dependencies.
+- `qt_tally_exporter/`: Native Qt desktop exporter.
+- `HMG/`: Native HMG/Harbour desktop exporter for Windows.
 
 ## 📋 Prerequisites
 
