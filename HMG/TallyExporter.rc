@@ -1,3 +1,12 @@
 MAINICON ICON "assets/app_icon.ico"
 SPLASH   PNG  "assets/tally_xml_exporter_splash.png"
+BTN_CONNECT      BITMAP "assets/icons/connect.bmp"
+BTN_CONNECT_LOAD BITMAP "assets/icons/connect_load.bmp"
+BTN_LOAD         BITMAP "assets/icons/load.bmp"
+BTN_CANCEL       BITMAP "assets/icons/cancel.bmp"
+BTN_BROWSE       BITMAP "assets/icons/browse.bmp"
+BTN_EXPORT       BITMAP "assets/icons/export.bmp"
+BTN_CLEAR        BITMAP "assets/icons/clear.bmp"
+BTN_ABOUT        BITMAP "assets/icons/about.bmp"
+BTN_EXIT         BITMAP "assets/icons/exit.bmp"
 

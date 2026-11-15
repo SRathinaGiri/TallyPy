@@ -33,9 +33,14 @@ module, `TallyExporter.prg`, is the main program.
 2. Open the required company in Tally.
 3. Run `TallyExporter.exe` and select **Connect**. Empty company and date fields
    are populated from the active company.
-4. Select **Load tables**. The program injects temporary TDL collections and
-   reads ledger, voucher, stock-item, and inventory-entry XML.
-5. Choose an export folder and select **Export all CSVs**.
+4. Select **Load**. The program injects temporary TDL collections and reads
+   ledger, voucher, stock-item, and inventory-entry XML. Alternatively, use
+   **Connect + Load** to perform both operations in one step.
+5. Choose an export folder and select **Export**.
+
+The top toolbar provides Connect, Connect + Load, Load, Cancel, Browse, Export,
+Clear, About, and Exit commands with icons and explanatory tooltips. Load is
+enabled only after a successful connection.
 
 Generated files:
 
@@ -53,6 +58,9 @@ UTF-8 with a BOM and are streamed to disk row-by-row.
 The first tab summarizes row counts for all five datasets and shows Amount,
 Debit Amount, Credit Amount, and Debit minus Credit totals for Vouchers and
 All Vouchers.
+
+The About window displays the embedded splash artwork and links directly to
+the HMG source folder in this repository.
 
 ## Native deployment
 

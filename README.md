@@ -31,7 +31,9 @@ is required.
 1. **Tally Running**: Tally must be open with at least one company loaded.
 2. **Connectivity**: Ensure the Tally ODBC/XML port is enabled (Default: 9000).
    - Verify in Tally: `F1` > `Settings` > `Connectivity`.
-3. **Python Environment**: Python 3.8+ installed.
+3. **No application runtime required**: The standalone Windows executable does
+   not require an installer or an additional application runtime. Python is
+   needed only when using the optional scripts directly.
 
 ## 🚀 Getting Started
 

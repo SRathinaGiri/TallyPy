@@ -77,7 +77,7 @@ RETURN hResult
 FUNCTION TallyLoadAll( cHost, cPort, cCompany, cFrom, cTo, bLog, bCancel )
    LOCAL hResult := {=>}, hInfo, hMeta, hPost, oDoc
    LOCAL aLedgers, aStock, aAll := {}, aVouchers := {}, aInventory := {}
-   LOCAL aChunks, aRows, aInvRows, aRow, aChunk
+   LOCAL aChunks, aRows, aInvRows, aRow, aChunk, nMerge
 
    hResult[ "ok" ] := .F.
    hResult[ "error" ] := ""
@@ -132,7 +132,13 @@ FUNCTION TallyLoadAll( cHost, cPort, cCompany, cFrom, cTo, bLog, bCancel )
       oDoc := ParseTallyXml( hPost[ "text" ], @hResult )
       IF oDoc == NIL; RETURN hResult; ENDIF
       aRows := ParseVoucherRows( oDoc, hMeta[ "vtypes" ], cCompany, cFrom, cTo )
+      nMerge := 0
       FOR EACH aRow IN aRows
+         nMerge++
+         IF nMerge % 200 == 0
+            DO EVENTS
+            IF Cancelled( bCancel ); RETURN CancelResult(); ENDIF
+         ENDIF
          AAdd( aAll, aRow )
          IF aRow[ 24 ] == "Accounting"
             AAdd( aVouchers, ASizeCopy( aRow, 23 ) )
@@ -158,7 +164,13 @@ FUNCTION TallyLoadAll( cHost, cPort, cCompany, cFrom, cTo, bLog, bCancel )
       oDoc := ParseTallyXml( hPost[ "text" ], @hResult )
       IF oDoc == NIL; RETURN hResult; ENDIF
       aInvRows := ParseInventoryRows( oDoc, cCompany, cFrom, cTo )
+      nMerge := 0
       FOR EACH aRow IN aInvRows
+         nMerge++
+         IF nMerge % 200 == 0
+            DO EVENTS
+            IF Cancelled( bCancel ); RETURN CancelResult(); ENDIF
+         ENDIF
          AAdd( aInventory, aRow )
       NEXT
    NEXT
@@ -215,8 +227,10 @@ STATIC FUNCTION PostToTally( cHost, cPort, cXml, nTimeout )
    hResult[ "ok" ] := .F.
    hResult[ "text" ] := ""
    hResult[ "error" ] := ""
+   DO EVENTS
    BEGIN SEQUENCE WITH {|oErr| Break( oErr ) }
       aHttp := TallyHttpPostUtf8( cHost, Val( cPort ), cXml, nTimeout )
+      DO EVENTS
       IF aHttp[ 1 ]
          hResult[ "text" ] := aHttp[ 3 ]
          hResult[ "ok" ] := .T.
@@ -229,10 +243,12 @@ STATIC FUNCTION PostToTally( cHost, cPort, cXml, nTimeout )
    RECOVER USING oError
       hResult[ "error" ] := "Tally request failed: " + ErrorText( oError ) + ". Check that Tally is running and its HTTP server is enabled on port " + cPort + "."
    END SEQUENCE
+   DO EVENTS
 RETURN hResult
 
 STATIC FUNCTION ParseTallyXml( cXml, hResult )
    LOCAL oDoc := NIL, oError, cReason, cStatus
+   DO EVENTS
    cXml := SanitizeTallyXml( cXml )
    BEGIN SEQUENCE WITH {|oErr| Break( oErr ) }
       oDoc := CreateObject( "Msxml2.DOMDocument.6.0" )
@@ -255,6 +271,7 @@ STATIC FUNCTION ParseTallyXml( cXml, hResult )
       hResult[ "error" ] := "Unable to parse Tally XML: " + ErrorText( oError )
       oDoc := NIL
    END SEQUENCE
+   DO EVENTS
 RETURN oDoc
 
 /*
@@ -667,7 +684,7 @@ STATIC PROCEDURE EvalLog( bLog, cText )
 RETURN
 
 STATIC FUNCTION WriteCsv( cPath, aHeaders, aRows )
-   LOCAL nHandle, aRow, lOk := .T.
+   LOCAL nHandle, aRow, lOk := .T., nRow := 0
    nHandle := FCreate( cPath )
    IF nHandle < 0
       RETURN .F.
@@ -676,6 +693,8 @@ STATIC FUNCTION WriteCsv( cPath, aHeaders, aRows )
       lOk := .F.
    ENDIF
    FOR EACH aRow IN aRows
+      nRow++
+      IF nRow % 200 == 0; DO EVENTS; ENDIF
       IF FWrite( nHandle, CsvLine( aRow ) + CRLF ) <= 0
          lOk := .F.
          EXIT

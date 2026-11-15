@@ -1,16 +1,25 @@
 #include "hmg.ch"
 
 #define APP_TITLE "Tally HMG Exporter"
-#define APP_VERSION "1.0.1"
+#define APP_VERSION "1.0.5"
 #define PROJECT_URL "https://github.com/SRathinaGiri/TallyPy/tree/main/HMG"
 STATIC s_hBundle := {=>}
 STATIC s_lBusy := .F.
 STATIC s_lCancel := .F.
+STATIC s_lConnected := .F.
+MEMVAR aVoucherRows, aAllVoucherRows, aLedgerRows, aStockItemRows, aStockVoucherRows
 
 FUNCTION Main()
+   PUBLIC aVoucherRows := {}
+   PUBLIC aAllVoucherRows := {}
+   PUBLIC aLedgerRows := {}
+   PUBLIC aStockItemRows := {}
+   PUBLIC aStockVoucherRows := {}
+
    SET MULTIPLE OFF
    SET DATE BRITISH
    SET CENTURY ON
+   SET TOOLTIPSTYLE BALLOON
 
    SET WINDOW MAIN OFF
    ShowStartupSplash()
@@ -25,37 +34,50 @@ FUNCTION Main()
       MAIN ;
       ON INIT AppInit()
 
-      @ 12, 12 FRAME FrameConnection CAPTION "Tally connection and period" WIDTH 612 HEIGHT 170
-      @ 40, 25 LABEL LblHost VALUE "Host" WIDTH 80 HEIGHT 24
-      @ 38, 105 TEXTBOX TxtHost VALUE "localhost" WIDTH 180 HEIGHT 24
-      @ 40, 310 LABEL LblPort VALUE "Port" WIDTH 55 HEIGHT 24
-      @ 38, 365 TEXTBOX TxtPort VALUE "9000" WIDTH 90 HEIGHT 24 NUMERIC MAXLENGTH 5
-      @ 74, 25 LABEL LblCompany VALUE "Company" WIDTH 80 HEIGHT 24
-      @ 72, 105 TEXTBOX TxtCompany VALUE "" WIDTH 350 HEIGHT 24
-      @ 108, 25 LABEL LblFrom VALUE "From date" WIDTH 80 HEIGHT 24
-      @ 106, 105 TEXTBOX TxtFrom VALUE "" WIDTH 140 HEIGHT 24 TOOLTIP "YYYYMMDD, YYYY-MM-DD or DD-MM-YYYY"
-      @ 108, 270 LABEL LblTo VALUE "To date" WIDTH 70 HEIGHT 24
-      @ 106, 335 TEXTBOX TxtTo VALUE "" WIDTH 120 HEIGHT 24 TOOLTIP "YYYYMMDD, YYYY-MM-DD or DD-MM-YYYY"
-      @ 140, 25 BUTTON BtnConnect CAPTION "Connect" WIDTH 100 HEIGHT 28 ACTION ConnectTally()
-      @ 140, 135 BUTTON BtnLoad CAPTION "Load tables" WIDTH 110 HEIGHT 28 ACTION LoadTables()
-      @ 140, 255 BUTTON BtnCancel CAPTION "Cancel" WIDTH 90 HEIGHT 28 ACTION RequestCancel()
-      @ 140, 355 BUTTON BtnAbout CAPTION "About" WIDTH 100 HEIGHT 28 ACTION ShowAbout()
+      DEFINE TOOLBAR MainToolbar BUTTONSIZE 125, 46 IMAGESIZE 30, 30 FONT "Segoe UI" SIZE 9 FLAT RIGHTTEXT BORDER
+         BUTTON BtnConnect CAPTION "Connect" PICTURE "BTN_CONNECT" ;
+            TOOLTIP "Test the Tally connection and detect the active company and period." ACTION ConnectTally()
+         BUTTON BtnConnectLoad CAPTION "Connect + Load" PICTURE "BTN_CONNECT_LOAD" ;
+            TOOLTIP "Connect to Tally and immediately load all tables when the connection succeeds." ACTION ConnectAndLoad()
+         BUTTON BtnLoad CAPTION "Load" PICTURE "BTN_LOAD" ;
+            TOOLTIP "Load all tables. This is enabled after a successful connection." ACTION LoadTables() SEPARATOR
+         BUTTON BtnCancel CAPTION "Cancel" PICTURE "BTN_CANCEL" ;
+            TOOLTIP "Request cancellation after the current Tally request finishes." ACTION RequestCancel() SEPARATOR
+         BUTTON BtnBrowse CAPTION "Browse" PICTURE "BTN_BROWSE" ;
+            TOOLTIP "Choose the folder where CSV files will be written." ACTION ChooseFolder()
+         BUTTON BtnExport CAPTION "Export" PICTURE "BTN_EXPORT" ;
+            TOOLTIP "Export every loaded table as a UTF-8 CSV file." ACTION ExportAll()
+         BUTTON BtnClear CAPTION "Clear" PICTURE "BTN_CLEAR" ;
+            TOOLTIP "Clear all loaded rows, counts, and totals from the application." ACTION ClearResults() SEPARATOR
+         BUTTON BtnAbout CAPTION "About" PICTURE "BTN_ABOUT" ;
+            TOOLTIP "Show application details and the source-code link." ACTION ShowAbout()
+         BUTTON BtnExit CAPTION "Exit" PICTURE "BTN_EXIT" ;
+            TOOLTIP "Close Tally Exporter." ACTION RequestExit()
+      END TOOLBAR
 
-      @ 12, 640 FRAME FrameDetected CAPTION "Detected / export" WIDTH 592 HEIGHT 170
-      @ 40, 653 LABEL LblDetected VALUE "Detected" WIDTH 75 HEIGHT 24
-      @ 38, 730 TEXTBOX TxtDetected VALUE "" WIDTH 480 HEIGHT 24 READONLY
-      @ 74, 653 LABEL LblFolder VALUE "Folder" WIDTH 75 HEIGHT 24
-      @ 72, 730 TEXTBOX TxtFolder VALUE "" WIDTH 380 HEIGHT 24
-      @ 70, 1118 BUTTON BtnBrowse CAPTION "Browse" WIDTH 92 HEIGHT 28 ACTION ChooseFolder()
-      @ 106, 653 CHECKBOX ChkOverwrite CAPTION "Overwrite existing CSV files" VALUE .F. WIDTH 240 HEIGHT 24
-      @ 138, 653 BUTTON BtnExport CAPTION "Export all CSVs" WIDTH 130 HEIGHT 28 ACTION ExportAll()
-      @ 138, 793 BUTTON BtnClear CAPTION "Clear results" WIDTH 110 HEIGHT 28 ACTION ClearResults()
+      @ 60, 12 FRAME FrameConnection CAPTION "Tally connection and period" WIDTH 612 HEIGHT 128
+      @ 88, 25 LABEL LblHost VALUE "Host" WIDTH 80 HEIGHT 24
+      @ 86, 105 TEXTBOX TxtHost VALUE "localhost" WIDTH 180 HEIGHT 24 ON CHANGE InvalidateConnection()
+      @ 88, 310 LABEL LblPort VALUE "Port" WIDTH 55 HEIGHT 24
+      @ 86, 365 TEXTBOX TxtPort VALUE "9000" WIDTH 90 HEIGHT 24 NUMERIC MAXLENGTH 5 ON CHANGE InvalidateConnection()
+      @ 122, 25 LABEL LblCompany VALUE "Company" WIDTH 80 HEIGHT 24
+      @ 120, 105 TEXTBOX TxtCompany VALUE "" WIDTH 350 HEIGHT 24
+      @ 156, 25 LABEL LblFrom VALUE "From date" WIDTH 80 HEIGHT 24
+      @ 154, 105 TEXTBOX TxtFrom VALUE "" WIDTH 140 HEIGHT 24 TOOLTIP "YYYYMMDD, YYYY-MM-DD or DD-MM-YYYY"
+      @ 156, 270 LABEL LblTo VALUE "To date" WIDTH 70 HEIGHT 24
+      @ 154, 335 TEXTBOX TxtTo VALUE "" WIDTH 120 HEIGHT 24 TOOLTIP "YYYYMMDD, YYYY-MM-DD or DD-MM-YYYY"
+
+      @ 60, 640 FRAME FrameDetected CAPTION "Detected / export" WIDTH 592 HEIGHT 128
+      @ 88, 653 LABEL LblDetected VALUE "Detected" WIDTH 75 HEIGHT 24
+      @ 86, 730 TEXTBOX TxtDetected VALUE "" WIDTH 480 HEIGHT 24 READONLY
+      @ 122, 653 LABEL LblFolder VALUE "Folder" WIDTH 75 HEIGHT 24
+      @ 120, 730 TEXTBOX TxtFolder VALUE "" WIDTH 480 HEIGHT 24
+      @ 154, 653 CHECKBOX ChkOverwrite CAPTION "Overwrite existing CSV files" VALUE .F. WIDTH 240 HEIGHT 24 TOOLTIP "Allow export to replace CSV files that already exist."
 
       DEFINE TAB TabData ;
-         AT 194, 12 ;
+         AT 200, 12 ;
          WIDTH 1220 ;
-         HEIGHT 430 ;
-         ON CHANGE RefreshActiveVirtualGrid()
+         HEIGHT 430
 
          PAGE "Summary"
             @ 35, 10 FRAME FrameCounts CAPTION "Counts" WIDTH 250 HEIGHT 330
@@ -94,50 +116,45 @@ FUNCTION Main()
             @ 35, 10 GRID GridVouchers WIDTH 1190 HEIGHT 340 ;
                HEADERS { "Date", "Type", "Base type", "Number", "Ledger", "MasterID", "Amount", "Dr/Cr", "Debit", "Credit", "Parent", "Primary group", "Nature", "Group nature", "PAN", "Party", "Party GSTIN", "Ledger GSTIN", "Narration", "Optional", "Company", "From", "To" } ;
                WIDTHS { 85, 110, 110, 90, 170, 75, 95, 55, 95, 95, 130, 130, 80, 95, 90, 150, 110, 110, 220, 65, 180, 85, 85 } ;
-               VIRTUAL ;
-               ITEMCOUNT 0 ;
-               ON QUERYDATA VirtualGridData( "vouchers" )
+               JUSTIFY { GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_RIGHT, GRID_JTFY_LEFT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT } ;
+               VIRTUAL ITEMCOUNT 0 ON QUERYDATA QueryVouchers()
          END PAGE
 
          PAGE "All vouchers"
             @ 35, 10 GRID GridAllVouchers WIDTH 1190 HEIGHT 340 ;
                HEADERS { "Date", "Type", "Base type", "Number", "Ledger", "MasterID", "Amount", "Dr/Cr", "Debit", "Credit", "Parent", "Primary group", "Nature", "Group nature", "PAN", "Party", "Party GSTIN", "Ledger GSTIN", "Narration", "Optional", "Company", "From", "To", "Category" } ;
                WIDTHS { 85, 110, 110, 90, 170, 75, 95, 55, 95, 95, 130, 130, 80, 95, 90, 150, 110, 110, 220, 65, 180, 85, 85, 90 } ;
-               VIRTUAL ;
-               ITEMCOUNT 0 ;
-               ON QUERYDATA VirtualGridData( "allvouchers" )
+               JUSTIFY { GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_RIGHT, GRID_JTFY_LEFT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT } ;
+               VIRTUAL ITEMCOUNT 0 ON QUERYDATA QueryAllVouchers()
          END PAGE
 
          PAGE "Ledgers"
             @ 35, 10 GRID GridLedgers WIDTH 1190 HEIGHT 340 ;
                HEADERS { "MasterID", "Name", "Primary group", "Nature", "Group nature", "PAN", "Starting", "Currency", "State", "Parent", "GSTIN", "Opening", "Closing", "Company", "From", "To" } ;
                WIDTHS { 75, 190, 140, 85, 100, 90, 85, 90, 100, 150, 120, 100, 100, 180, 85, 85 } ;
-               VIRTUAL ;
-               ITEMCOUNT 0 ;
-               ON QUERYDATA VirtualGridData( "ledgers" )
+               JUSTIFY { GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT } ;
+               VIRTUAL ITEMCOUNT 0 ON QUERYDATA QueryLedgers()
          END PAGE
 
          PAGE "Stock items"
-            @ 35, 10 GRID GridStock WIDTH 1190 HEIGHT 340 ;
+            @ 35, 10 GRID GridStockItems WIDTH 1190 HEIGHT 340 ;
                HEADERS { "Name", "Parent", "Category", "Ledger", "Opening qty", "Opening value", "Basic value", "Basic qty", "Opening rate", "Closing qty", "Closing value", "Closing rate", "Company", "From", "To" } ;
                WIDTHS { 190, 140, 120, 160, 100, 100, 100, 100, 100, 100, 100, 100, 180, 85, 85 } ;
-               VIRTUAL ;
-               ITEMCOUNT 0 ;
-               ON QUERYDATA VirtualGridData( "stock" )
+               JUSTIFY { GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT } ;
+               VIRTUAL ITEMCOUNT 0 ON QUERYDATA QueryStockItems()
          END PAGE
 
          PAGE "Stock vouchers"
-            @ 35, 10 GRID GridInventory WIDTH 1190 HEIGHT 340 ;
+            @ 35, 10 GRID GridStockVouchers WIDTH 1190 HEIGHT 340 ;
                HEADERS { "Date", "Type", "Number", "Stock item", "Quantity", "Rate", "Amount", "Godown", "Batch", "Narration", "Company", "From", "To" } ;
                WIDTHS { 85, 120, 90, 190, 100, 95, 100, 130, 110, 220, 180, 85, 85 } ;
-               VIRTUAL ;
-               ITEMCOUNT 0 ;
-               ON QUERYDATA VirtualGridData( "inventory" )
+               JUSTIFY { GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_LEFT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT, GRID_JTFY_RIGHT } ;
+               VIRTUAL ITEMCOUNT 0 ON QUERYDATA QueryStockVouchers()
          END PAGE
       END TAB
 
-      @ 636, 12 LABEL LblSummary VALUE "No data loaded" WIDTH 1220 HEIGHT 24 BOLD
-      @ 664, 12 EDITBOX EdtLog VALUE "" WIDTH 1220 HEIGHT 100 READONLY NOHSCROLL
+      @ 642, 12 LABEL LblSummary VALUE "No data loaded" WIDTH 1220 HEIGHT 24 BOLD
+      @ 670, 12 EDITBOX EdtLog VALUE "" WIDTH 1220 HEIGHT 94 READONLY NOHSCROLL
 
       DEFINE STATUSBAR
          STATUSITEM "Ready" WIDTH 1040
@@ -146,6 +163,7 @@ FUNCTION Main()
    END WINDOW
 
    MainForm.BtnCancel.Enabled := .F.
+   MainForm.BtnLoad.Enabled := .F.
    ResetSummary()
    CENTER WINDOW MainForm
    ACTIVATE WINDOW MainForm
@@ -197,22 +215,26 @@ STATIC PROCEDURE SetBusy( lBusy, cStatus )
    MainForm.TxtFrom.Enabled := ! lBusy
    MainForm.TxtTo.Enabled := ! lBusy
    MainForm.BtnConnect.Enabled := ! lBusy
-   MainForm.BtnLoad.Enabled := ! lBusy
+   MainForm.BtnConnectLoad.Enabled := ! lBusy
+   MainForm.BtnLoad.Enabled := ! lBusy .AND. s_lConnected
    MainForm.BtnBrowse.Enabled := ! lBusy
    MainForm.BtnExport.Enabled := ! lBusy
    MainForm.BtnClear.Enabled := ! lBusy
+   MainForm.BtnAbout.Enabled := ! lBusy
+   MainForm.BtnExit.Enabled := ! lBusy
    MainForm.BtnCancel.Enabled := lBusy
    MainForm.TabData.Enabled := ! lBusy
    MainForm.StatusBar.Item( 1 ) := cStatus
    DO EVENTS
 RETURN
 
-STATIC PROCEDURE ConnectTally()
-   LOCAL hResult
+STATIC FUNCTION ConnectTally()
+   LOCAL hResult, lOk := .F.
    IF s_lBusy
-      RETURN
+      RETURN .F.
    ENDIF
    s_lCancel := .F.
+   s_lConnected := .F.
    SetBusy( .T., "Connecting to Tally..." )
    LogMessage( "Connecting to " + AllTrim( MainForm.TxtHost.Value ) + ":" + LTrim( Str( MainForm.TxtPort.Value ) ) )
    hResult := TallyCompanyInfo( AllTrim( MainForm.TxtHost.Value ), LTrim( Str( MainForm.TxtPort.Value ) ) )
@@ -227,12 +249,32 @@ STATIC PROCEDURE ConnectTally()
       IF Empty( AllTrim( MainForm.TxtTo.Value ) )
          MainForm.TxtTo.Value := hResult[ "to" ]
       ENDIF
+      s_lConnected := .T.
+      lOk := .T.
       LogMessage( "Connected. Active company: " + hResult[ "name" ] )
       SetBusy( .F., "Connected to " + hResult[ "name" ] )
    ELSE
       LogMessage( "Connection failed: " + hResult[ "error" ] )
       SetBusy( .F., "Connection failed" )
       MsgStop( hResult[ "error" ], APP_TITLE )
+   ENDIF
+RETURN lOk
+
+STATIC PROCEDURE ConnectAndLoad()
+   IF ConnectTally()
+      DO EVENTS
+      LoadTables()
+   ENDIF
+RETURN
+
+STATIC PROCEDURE InvalidateConnection()
+   IF ! s_lBusy
+      s_lConnected := .F.
+      IF IsWindowDefined( MainForm )
+         IF IsControlDefined( BtnLoad, MainForm )
+            MainForm.BtnLoad.Enabled := .F.
+         ENDIF
+      ENDIF
    ENDIF
 RETURN
 
@@ -241,18 +283,26 @@ STATIC PROCEDURE LoadTables()
    IF s_lBusy
       RETURN
    ENDIF
+   IF ! s_lConnected
+      MsgExclamation( "Connect to Tally successfully before loading tables.", APP_TITLE )
+      RETURN
+   ENDIF
    s_lCancel := .F.
    cPort := LTrim( Str( MainForm.TxtPort.Value ) )
    SetBusy( .T., "Loading Tally tables..." )
    LogMessage( "Load started. TDL collections will be injected into Tally." )
+   WAIT WINDOW "Loading tables from Tally... You can continue to use Cancel." NOWAIT
+   DO EVENTS
    hResult := TallyLoadAll( AllTrim( MainForm.TxtHost.Value ), cPort, ;
       AllTrim( MainForm.TxtCompany.Value ), AllTrim( MainForm.TxtFrom.Value ), ;
       AllTrim( MainForm.TxtTo.Value ), { |c| LogMessage( c ) }, { || s_lCancel } )
+   WAIT CLEAR
+   DO EVENTS
    IF hResult[ "ok" ]
       s_hBundle := hResult
+      BindVirtualGridRows( hResult )
       MainForm.TxtDetected.Value := hResult[ "company" ] + "  (" + FormatTallyDate( hResult[ "from" ] ) + " to " + FormatTallyDate( hResult[ "to" ] ) + ")"
       UpdateSummary( hResult )
-      RefreshActiveVirtualGrid()
       MainForm.LblSummary.Value := "Rows: vouchers " + NToC( Len( hResult[ "vouchers" ] ) ) + ;
          " | all vouchers " + NToC( Len( hResult[ "allvouchers" ] ) ) + ;
          " | ledgers " + NToC( Len( hResult[ "ledgers" ] ) ) + ;
@@ -269,48 +319,99 @@ STATIC PROCEDURE LoadTables()
    ENDIF
 RETURN
 
-/*
- * HMG5 owner-data grids inside a TAB must receive ItemCount only while their
- * page is visible. Setting it on a hidden page makes the later ShowWindow()
- * transition request data recursively and can freeze the UI.
- */
-STATIC PROCEDURE RefreshActiveVirtualGrid()
-   LOCAL nPage, cGrid, cTable, nRows := 0
-   LOCAL aGrids := { "GridVouchers", "GridAllVouchers", "GridLedgers", "GridStock", "GridInventory" }
-   LOCAL aTables := { "vouchers", "allvouchers", "ledgers", "stock", "inventory" }
-
-   IF ! IsControlDefined( GridInventory, MainForm )
-      RETURN
-   ENDIF
-   nPage := MainForm.TabData.Value
-   IF nPage == 1
-      RETURN
-   ENDIF
-   nPage--
-   IF nPage < 1 .OR. nPage > Len( aGrids )
-      RETURN
-   ENDIF
-   cGrid := aGrids[ nPage ]
-   cTable := aTables[ nPage ]
-   IF Len( s_hBundle ) > 0 .AND. hb_HHasKey( s_hBundle, cTable )
-      nRows := Len( s_hBundle[ cTable ] )
-   ENDIF
-   SetProperty( "MainForm", cGrid, "ItemCount", nRows )
+STATIC PROCEDURE DisableVirtualGridUpdates()
+   MainForm.GridVouchers.DisableUpdate()
+   MainForm.GridAllVouchers.DisableUpdate()
+   MainForm.GridLedgers.DisableUpdate()
+   MainForm.GridStockItems.DisableUpdate()
+   MainForm.GridStockVouchers.DisableUpdate()
 RETURN
 
-STATIC PROCEDURE VirtualGridData( cTable )
-   LOCAL nRow := This.QueryRowIndex
-   LOCAL nCol := This.QueryColIndex
-   LOCAL aRows
+STATIC PROCEDURE EnableVirtualGridUpdates()
+   MainForm.GridVouchers.EnableUpdate()
+   MainForm.GridAllVouchers.EnableUpdate()
+   MainForm.GridLedgers.EnableUpdate()
+   MainForm.GridStockItems.EnableUpdate()
+   MainForm.GridStockVouchers.EnableUpdate()
+RETURN
 
-   This.QueryData := ""
-   IF Len( s_hBundle ) == 0 .OR. ! hb_HHasKey( s_hBundle, cTable )
-      RETURN
+STATIC PROCEDURE BindVirtualGridRows( hResult )
+   DisableVirtualGridUpdates()
+
+   MainForm.GridVouchers.ItemCount := 0
+   MainForm.GridAllVouchers.ItemCount := 0
+   MainForm.GridLedgers.ItemCount := 0
+   MainForm.GridStockItems.ItemCount := 0
+   MainForm.GridStockVouchers.ItemCount := 0
+
+   aVoucherRows := hResult[ "vouchers" ]
+   aAllVoucherRows := hResult[ "allvouchers" ]
+   aLedgerRows := hResult[ "ledgers" ]
+   aStockItemRows := hResult[ "stock" ]
+   aStockVoucherRows := hResult[ "inventory" ]
+
+   MainForm.GridVouchers.ItemCount := Len( aVoucherRows )
+   MainForm.GridAllVouchers.ItemCount := Len( aAllVoucherRows )
+   MainForm.GridLedgers.ItemCount := Len( aLedgerRows )
+   MainForm.GridStockItems.ItemCount := Len( aStockItemRows )
+   MainForm.GridStockVouchers.ItemCount := Len( aStockVoucherRows )
+
+   IF Len( aVoucherRows ) > 0
+      MainForm.GridVouchers.Value := 1
    ENDIF
-   aRows := s_hBundle[ cTable ]
-   IF nRow >= 1 .AND. nRow <= Len( aRows ) .AND. ;
-      nCol >= 1 .AND. nCol <= Len( aRows[ nRow ] )
-      This.QueryData := hb_CStr( aRows[ nRow ][ nCol ] )
+   IF Len( aAllVoucherRows ) > 0
+      MainForm.GridAllVouchers.Value := 1
+   ENDIF
+   IF Len( aLedgerRows ) > 0
+      MainForm.GridLedgers.Value := 1
+   ENDIF
+   IF Len( aStockItemRows ) > 0
+      MainForm.GridStockItems.Value := 1
+   ENDIF
+   IF Len( aStockVoucherRows ) > 0
+      MainForm.GridStockVouchers.Value := 1
+   ENDIF
+
+   EnableVirtualGridUpdates()
+RETURN
+
+STATIC PROCEDURE QueryVouchers()
+   This.QueryData := ""
+   IF This.QueryRowIndex >= 1 .AND. This.QueryRowIndex <= Len( aVoucherRows ) .AND. ;
+      This.QueryColIndex >= 1 .AND. This.QueryColIndex <= Len( aVoucherRows[ This.QueryRowIndex ] )
+      This.QueryData := aVoucherRows[ This.QueryRowIndex, This.QueryColIndex ]
+   ENDIF
+RETURN
+
+STATIC PROCEDURE QueryAllVouchers()
+   This.QueryData := ""
+   IF This.QueryRowIndex >= 1 .AND. This.QueryRowIndex <= Len( aAllVoucherRows ) .AND. ;
+      This.QueryColIndex >= 1 .AND. This.QueryColIndex <= Len( aAllVoucherRows[ This.QueryRowIndex ] )
+      This.QueryData := aAllVoucherRows[ This.QueryRowIndex, This.QueryColIndex ]
+   ENDIF
+RETURN
+
+STATIC PROCEDURE QueryLedgers()
+   This.QueryData := ""
+   IF This.QueryRowIndex >= 1 .AND. This.QueryRowIndex <= Len( aLedgerRows ) .AND. ;
+      This.QueryColIndex >= 1 .AND. This.QueryColIndex <= Len( aLedgerRows[ This.QueryRowIndex ] )
+      This.QueryData := aLedgerRows[ This.QueryRowIndex, This.QueryColIndex ]
+   ENDIF
+RETURN
+
+STATIC PROCEDURE QueryStockItems()
+   This.QueryData := ""
+   IF This.QueryRowIndex >= 1 .AND. This.QueryRowIndex <= Len( aStockItemRows ) .AND. ;
+      This.QueryColIndex >= 1 .AND. This.QueryColIndex <= Len( aStockItemRows[ This.QueryRowIndex ] )
+      This.QueryData := aStockItemRows[ This.QueryRowIndex, This.QueryColIndex ]
+   ENDIF
+RETURN
+
+STATIC PROCEDURE QueryStockVouchers()
+   This.QueryData := ""
+   IF This.QueryRowIndex >= 1 .AND. This.QueryRowIndex <= Len( aStockVoucherRows ) .AND. ;
+      This.QueryColIndex >= 1 .AND. This.QueryColIndex <= Len( aStockVoucherRows[ This.QueryRowIndex ] )
+      This.QueryData := aStockVoucherRows[ This.QueryRowIndex, This.QueryColIndex ]
    ENDIF
 RETURN
 
@@ -320,6 +421,14 @@ STATIC PROCEDURE RequestCancel()
       MainForm.StatusBar.Item( 1 ) := "Cancellation requested..."
       LogMessage( "Cancellation requested; the current WinHTTP call must finish first." )
    ENDIF
+RETURN
+
+STATIC PROCEDURE RequestExit()
+   IF s_lBusy
+      MsgExclamation( "Cancel the current load before exiting.", APP_TITLE )
+      RETURN
+   ENDIF
+   MainForm.Release
 RETURN
 
 STATIC PROCEDURE ChooseFolder()
@@ -348,7 +457,18 @@ RETURN
 
 STATIC PROCEDURE ClearResults()
    s_hBundle := {=>}
-   RefreshActiveVirtualGrid()
+   DisableVirtualGridUpdates()
+   MainForm.GridVouchers.ItemCount := 0
+   MainForm.GridAllVouchers.ItemCount := 0
+   MainForm.GridLedgers.ItemCount := 0
+   MainForm.GridStockItems.ItemCount := 0
+   MainForm.GridStockVouchers.ItemCount := 0
+   aVoucherRows := {}
+   aAllVoucherRows := {}
+   aLedgerRows := {}
+   aStockItemRows := {}
+   aStockVoucherRows := {}
+   EnableVirtualGridUpdates()
    ResetSummary()
    MainForm.LblSummary.Value := "No data loaded"
    MainForm.TxtDetected.Value := ""
@@ -392,8 +512,10 @@ STATIC PROCEDURE ResetSummary()
 RETURN
 
 STATIC FUNCTION SummarizeRows( aRows )
-   LOCAL aTotals := { 0.0, 0.0, 0.0 }, aRow
+   LOCAL aTotals := { 0.0, 0.0, 0.0 }, aRow, nRow := 0
    FOR EACH aRow IN aRows
+      nRow++
+      IF nRow % 200 == 0; DO EVENTS; ENDIF
       IF Len( aRow ) >= 10
          aTotals[ 1 ] += SummaryNumber( aRow[ 7 ] )
          aTotals[ 2 ] += SummaryNumber( aRow[ 9 ] )
