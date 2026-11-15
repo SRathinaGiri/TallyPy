@@ -151,7 +151,7 @@ STATIC PROCEDURE AppInit()
       cDocs := GetCurrentFolder()
    ENDIF
    MainForm.TxtFolder.Value := cDocs
-   LogMessage( "Ready. Uses Windows WinHTTP and MSXML; no Qt runtime is required." )
+   LogMessage( "Ready." )
 RETURN
 
 STATIC PROCEDURE SetBusy( lBusy, cStatus )

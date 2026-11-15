@@ -32,8 +32,8 @@ FUNCTION TallyCompanyInfo( cHost, cPort )
       RETURN hResult
    ENDIF
    /*
-    * This is the same active-company collection used by the Qt exporter.  It
-    * must be posted as actual UTF-8 bytes; sending a COM BSTR while declaring
+    * The active-company collection must be posted as actual UTF-8 bytes;
+    * sending a COM BSTR while declaring
     * UTF-8 can corrupt this request inside TallyPrime.
     */
    oNodes := oDoc:selectNodes( "//COMPANY" )

@@ -3,3 +3,5 @@
 *.out
 *.err
 *_result.txt
+ErrorLog.Htm
+dist/

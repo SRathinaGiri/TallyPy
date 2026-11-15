@@ -4,7 +4,7 @@
  * string makes it a COM BSTR, leaving the transmitted encoding ambiguous even
  * when the Content-Type claims UTF-8.  TallyHttpPostUtf8 sends the original
  * Harbour UTF-8 bytes directly through the native WinHTTP API, matching the
- * QByteArray/requests behavior of the working Qt and Python exporters.
+ * byte-oriented behavior required by Tally's HTTP/XML endpoint.
  */
 
 #include "hbapi.h"

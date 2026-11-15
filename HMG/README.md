@@ -1,17 +1,15 @@
 # Tally HMG Exporter
 
-This folder contains the native HMG/Harbour port of **Tally Qt Exporter**.
+This folder contains the native HMG/Harbour **Tally Exporter** for Windows.
 
-- `../qt_tally_exporter/` contains the Qt implementation from
-  [SRathinaGiri/TallyPy](https://github.com/SRathinaGiri/TallyPy/tree/main/qt_tally_exporter).
 - `TallyExporter.prg` is the HMG user interface.
 - `tally_service.prg` is the native Tally HTTP, XML/TDL, parsing, and CSV layer.
 - `TallyExporter.hbp` is also the HMG IDE project: `TallyExporter.prg` is listed
   first and contains `Main()` and the main window.
 
-The HMG application uses Windows `WinHttp.WinHttpRequest.5.1` for HTTP and
+The application uses Windows `WinHttp.WinHttpRequest.5.1` for HTTP and
 `MSXML2.DOMDocument.6.0` for XML parsing. Both are Windows components, so the
-deployed application does not need Qt, Python, plug-ins, or application DLLs.
+deployed application does not need plug-ins or additional application DLLs.
 
 ## Build
 
@@ -23,7 +21,7 @@ build.bat
 
 The build produces `TallyExporter.exe` in this folder. `TallyExporter.hbp`
 contains the Harbour project definition and `TallyExporter.rc` embeds the
-upstream application icon plus the **Tally XML Exporter** startup splash.
+application icon plus the **Tally XML Exporter** startup splash.
 
 To work in HMG IDE, open `TallyExporter.hbp`. Its companion
 `TallyExporter.hbc` contains the IDE/build configuration; the first project

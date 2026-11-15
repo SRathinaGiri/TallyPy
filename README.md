@@ -1,6 +1,11 @@
-# TallyPy: XML-Based Data Extractor & Explorer
+# Tally Exporter
 
-TallyPy is a robust Python-based suite designed to extract accounting and inventory data from Tally using dynamic TDL over XML. It eliminates the need for external TDL files or ODBC drivers, providing a seamless bridge between Tally and data analysis tools like Power BI, CSV, and Excel.
+Tally Exporter is a standalone Windows application for extracting accounting
+and inventory data from Tally through dynamic TDL over XML. Download and run
+the single `TallyExporter.exe`; no installer or additional application runtime
+is required.
+
+[Download the latest Windows release](https://github.com/SRathinaGiri/TallyPy/releases/latest)
 
 ## 🚀 Key Features
 
@@ -8,19 +13,18 @@ TallyPy is a robust Python-based suite designed to extract accounting and invent
 - **Auto-Detection**: Automatically detects the active company name and financial period (Starting From/Ending At) from Tally.
 - **Accounting Data**: Robust extraction of Ledgers and Vouchers (Sales, Purchase, Journal, Receipt, Payment, etc.).
 - **Inventory Data**: Specialized extraction of Stock Items and Stock Vouchers, including Receipt Notes, Delivery Notes, and Stock Journals.
-- **Python Desktop Utility**: A Tkinter interface (`tally_xml_exporter.py`) to load, preview with pagination, and export Tally data as CSV.
+- **Standalone Windows App**: Native HMG/Harbour interface with virtual data grids and CSV export.
 - **Power BI Ready**: Optimized Python scripts designed to be used directly within Power BI's `Python.Execute` data source.
 
 ## 🛠️ Components
 
-- `tally_xml_exporter.py`: The main Python desktop utility with CSV-backed pagination for large exports.
+- `HMG/`: Source for the main standalone Windows application.
+- `tally_xml_exporter.py`: Optional Python desktop utility with CSV-backed pagination for large exports.
 - `tally_ledgers.py`: Extractor for Ledger masters.
 - `tally_vouchers.py`: Extractor for Accounting transactions.
 - `tally_stock_items.py`: Extractor for Stock Item masters.
 - `tally_stock_vouchers.py`: Extractor for Inventory transactions (Stock Ledgers).
 - `requirements.txt`: List of Python dependencies.
-- `qt_tally_exporter/`: Native Qt desktop exporter.
-- `HMG/`: Native HMG/Harbour desktop exporter for Windows.
 
 ## 📋 Prerequisites
 
@@ -31,21 +35,20 @@ TallyPy is a robust Python-based suite designed to extract accounting and invent
 
 ## 🚀 Getting Started
 
+1. Download `TallyExporter.exe` from the
+   [latest release](https://github.com/SRathinaGiri/TallyPy/releases/latest).
+2. Start Tally and open the required company.
+3. Run `TallyExporter.exe`, connect to Tally, load the tables, and export CSVs.
+
+To build or inspect the source:
+
 1. **Clone the repository**:
    ```bash
    git clone https://github.com/SRathinaGiri/TallyPy.git
    cd TallyPy
    ```
 
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Run the desktop exporter**:
-   ```bash
-   python tally_xml_exporter.py
-   ```
+2. Open [`HMG/README.md`](HMG/README.md) for the native build instructions.
 
 ## 📊 Power BI Integration
 
